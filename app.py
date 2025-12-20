@@ -47,8 +47,11 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
-SUMRULES_PATH = DATA_DIR / "sum_rules.json"
 
+# ✅ 표현규칙(단위 목록 + 기본단위)
+EXPR_RULES_PATH = DATA_DIR / "expression_rules.json"
+
+# ✅ 백업폴더
 BACKUP_DIR = DATA_DIR / "rules_backup"
 BACKUP_DIR.mkdir(exist_ok=True)
 
@@ -114,16 +117,90 @@ def _safe_int(v) -> Optional[int]:
 
 
 # =====================================================
-# RULES: 1) 상품명 매칭규칙
+# 표현규칙 (단위: 통/개/팩/봉 등) - 관리용
+# =====================================================
+def default_expression_rules() -> Dict:
+    return {
+        "default_unit": "개",  # 구분이 비어있을 때 기본 단위
+        "units": [
+            {"enabled": True, "unit": "개"},
+            {"enabled": True, "unit": "봉"},
+            {"enabled": True, "unit": "통"},
+            {"enabled": True, "unit": "팩"},
+        ],
+        "note": "표현규칙은 합산규칙(예: 5개씩 끊기) 적용 대상 단위를 정합니다.",
+    }
+
+
+def load_expression_rules() -> Dict:
+    if not EXPR_RULES_PATH.exists():
+        data = default_expression_rules()
+        save_expression_rules(data)
+        return data
+    try:
+        data = json.loads(EXPR_RULES_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid")
+        if "units" not in data or not isinstance(data["units"], list):
+            data["units"] = default_expression_rules()["units"]
+        if "default_unit" not in data or not isinstance(data["default_unit"], str):
+            data["default_unit"] = default_expression_rules()["default_unit"]
+        # 정리
+        cleaned_units = []
+        for r in data["units"]:
+            u = normalize_text(r.get("unit", ""))
+            if not u:
+                continue
+            cleaned_units.append({"enabled": bool(r.get("enabled", True)), "unit": u})
+        data["units"] = cleaned_units
+        return data
+    except Exception:
+        data = default_expression_rules()
+        save_expression_rules(data)
+        return data
+
+
+def save_expression_rules(data: Dict) -> None:
+    EXPR_RULES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_bundle_units(expr: Dict) -> List[str]:
+    units = []
+    for r in expr.get("units", []):
+        if r.get("enabled", True):
+            u = normalize_text(r.get("unit", ""))
+            if u:
+                units.append(u)
+    # 중복 제거(순서 유지)
+    seen = set()
+    out = []
+    for u in units:
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+
+def build_bundle_re(bundle_units: List[str]) -> re.Pattern:
+    # 예: ^\s*(\d+)\s*(개|봉|통|팩)\s*$
+    if not bundle_units:
+        bundle_units = ["개"]
+    unit_alt = "|".join(map(re.escape, bundle_units))
+    return re.compile(rf"^\s*(\d+)\s*({unit_alt})\s*$")
+
+
+# =====================================================
+# RULES: 상품명 매칭규칙 (여기에 합산규칙 N 포함)
 # =====================================================
 def default_mapping_rules() -> List[Dict]:
-    # ✅ 규칙은 "위에서 아래 순서대로" 매칭되며, 첫 매칭 1개만 적용
+    # 규칙은 표의 위→아래 순서대로 적용되며, 첫 매칭 1개만 적용
     return [
         {
             "enabled": True,
             "match_type": "contains",
             "pattern": "와일드루꼴라",
             "display_name": "와일드",
+            "sum_rule": None,  # 예: 5 (개/봉/통/팩 단위에만 적용)
             "note": '예) "채소팜 와일드루꼴라 1kg ..." -> 와일드',
         },
         {
@@ -131,7 +208,17 @@ def default_mapping_rules() -> List[Dict]:
             "match_type": "contains",
             "pattern": "라디치오",
             "display_name": "라디치오",
+            "sum_rule": None,
             "note": '예) "채소팜 라디치오 1통 ..." -> 라디치오',
+        },
+        # 예시
+        {
+            "enabled": False,
+            "match_type": "contains",
+            "pattern": "오렌지",
+            "display_name": "오렌지",
+            "sum_rule": 5,
+            "note": "예) 오렌지 합산규칙=5",
         },
     ]
 
@@ -147,13 +234,16 @@ def load_mapping_rules() -> List[Dict]:
         if isinstance(raw, list):
             cleaned = []
             for r in raw:
-                # 과거 버전 sum_rule/priority 같은 필드가 있어도 무시
+                sr = _safe_int(r.get("sum_rule"))
+                if sr is not None and sr < 2:
+                    sr = None
                 cleaned.append(
                     dict(
                         enabled=bool(r.get("enabled", True)),
                         match_type=normalize_text(r.get("match_type", "contains")) or "contains",
                         pattern=normalize_text(r.get("pattern", "")),
                         display_name=normalize_text(r.get("display_name", "")),
+                        sum_rule=sr,
                         note=normalize_text(r.get("note", "")),
                     )
                 )
@@ -170,13 +260,13 @@ def save_mapping_rules(rules: List[Dict]) -> None:
     MAPPING_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
+def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optional[int]]:
     """
-    return: (제품명, 매칭성공여부)
+    return: (제품명, 매칭성공여부, 합산규칙N or None)
     """
     actual = normalize_text(actual_name)
     if not actual:
-        return "", False
+        return "", False, None
 
     for r in rules:
         if not r.get("enabled", True):
@@ -185,6 +275,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
         mt = normalize_text(r.get("match_type", "contains")) or "contains"
         pattern = normalize_text(r.get("pattern", ""))
         display = normalize_text(r.get("display_name", ""))
+        sr = _safe_int(r.get("sum_rule"))
 
         if not pattern or not display:
             continue
@@ -201,7 +292,9 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
                 matched = False
 
         if matched:
-            return display, True
+            if sr is not None and sr < 2:
+                sr = None
+            return display, True, sr
 
     # --- fallback ---
     s = re.sub(r"^\s*채소팜\s*", "", actual)
@@ -213,7 +306,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
 
     toks = s.split()
     if not toks:
-        return actual, False
+        return actual, False, None
 
     PREFIX = {"생", "유기농", "국산", "수입", "냉동", "베이비", "프리미엄"}
     if len(toks) >= 2 and toks[0] in PREFIX:
@@ -221,12 +314,12 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
     else:
         fallback = toks[0]
 
-    return fallback, False
+    return fallback, False, None
 
 
 def mapping_df_from_list(rules: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(rules)
-    keep = ["enabled", "match_type", "pattern", "display_name", "note"]
+    keep = ["enabled", "match_type", "pattern", "display_name", "sum_rule", "note"]
     for c in keep:
         if c not in df.columns:
             df[c] = None
@@ -245,158 +338,16 @@ def mapping_list_from_df(edited: pd.DataFrame) -> List[Dict]:
         if mt not in {"contains", "exact", "regex"}:
             mt = "contains"
 
+        sr = _safe_int(row.get("sum_rule"))
+        if sr is not None and sr < 2:
+            sr = None
+
         cleaned.append(
             dict(
                 enabled=bool(row.get("enabled", True)),
                 match_type=mt,
                 pattern=pattern,
                 display_name=display,
-                note=normalize_text(row.get("note")),
-            )
-        )
-    return cleaned
-
-
-# =====================================================
-# RULES: 2) 합산규칙(별도 관리)
-# =====================================================
-def default_sum_rules() -> List[Dict]:
-    # 제품명(표시될 상품명)에 대해 합산규칙 N을 매칭
-    # (실제 분해/합산은 개/봉/통/팩 단위에만 적용됨)
-    return [
-        {
-            "enabled": False,
-            "match_type": "exact",
-            "pattern": "오렌지",
-            "sum_rule": 5,
-            "note": "예: 오렌지 합산규칙 5",
-        }
-    ]
-
-
-def load_sum_rules(mapping_rules: Optional[List[Dict]] = None) -> List[Dict]:
-    # sum_rules.json이 없으면: 기존 name_mappings.json에 sum_rule이 들어있던 옛 버전을 자동 흡수(가능하면)
-    if SUMRULES_PATH.exists():
-        try:
-            raw = json.loads(SUMRULES_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                out = []
-                for r in raw:
-                    sr = _safe_int(r.get("sum_rule"))
-                    if sr is not None and sr < 2:
-                        sr = None
-                    out.append(
-                        dict(
-                            enabled=bool(r.get("enabled", True)),
-                            match_type=normalize_text(r.get("match_type", "exact")) or "exact",
-                            pattern=normalize_text(r.get("pattern", "")),
-                            sum_rule=sr,
-                            note=normalize_text(r.get("note", "")),
-                        )
-                    )
-                return out
-        except Exception:
-            pass
-
-    # ---- legacy absorb ----
-    legacy = []
-    try:
-        if MAPPING_PATH.exists():
-            raw = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                for r in raw:
-                    sr = _safe_int(r.get("sum_rule"))
-                    dn = normalize_text(r.get("display_name", ""))
-                    if sr and sr >= 2 and dn:
-                        legacy.append(
-                            dict(
-                                enabled=bool(r.get("enabled", True)),
-                                match_type="exact",
-                                pattern=dn,
-                                sum_rule=sr,
-                                note="(구버전에서 자동 이관)",
-                            )
-                        )
-    except Exception:
-        legacy = []
-
-    if legacy:
-        save_sum_rules(legacy)
-        return legacy
-
-    rules = default_sum_rules()
-    save_sum_rules(rules)
-    return rules
-
-
-def save_sum_rules(rules: List[Dict]) -> None:
-    SUMRULES_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def apply_sum_rule(product_name: str, sum_rules: List[Dict]) -> Optional[int]:
-    """
-    제품명(표시될 상품명)을 기준으로 합산규칙 N 반환 (첫 매칭 1개)
-    """
-    p = normalize_text(product_name)
-    if not p:
-        return None
-
-    for r in sum_rules:
-        if not r.get("enabled", True):
-            continue
-
-        mt = normalize_text(r.get("match_type", "exact")) or "exact"
-        pattern = normalize_text(r.get("pattern", ""))
-        sr = _safe_int(r.get("sum_rule", None))
-
-        if not pattern or sr is None or sr < 2:
-            continue
-
-        matched = False
-        if mt == "exact":
-            matched = (p == pattern)
-        elif mt == "contains":
-            matched = (pattern in p)
-        elif mt == "regex":
-            try:
-                matched = bool(re.search(pattern, p))
-            except re.error:
-                matched = False
-
-        if matched:
-            return sr
-
-    return None
-
-
-def sumrules_df_from_list(rules: List[Dict]) -> pd.DataFrame:
-    df = pd.DataFrame(rules)
-    keep = ["enabled", "match_type", "pattern", "sum_rule", "note"]
-    for c in keep:
-        if c not in df.columns:
-            df[c] = None
-    return df[keep]
-
-
-def sumrules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
-    cleaned = []
-    for _, row in edited.iterrows():
-        pattern = normalize_text(row.get("pattern"))
-        sr = _safe_int(row.get("sum_rule"))
-
-        if not pattern or sr is None or sr < 2:
-            # pattern 또는 sum_rule이 없으면 스킵 (삭제 효과)
-            continue
-
-        mt = normalize_text(row.get("match_type")) or "exact"
-        if mt not in {"contains", "exact", "regex"}:
-            mt = "exact"
-
-        cleaned.append(
-            dict(
-                enabled=bool(row.get("enabled", True)),
-                match_type=mt,
-                pattern=pattern,
                 sum_rule=sr,
                 note=normalize_text(row.get("note")),
             )
@@ -407,7 +358,7 @@ def sumrules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
 # =====================================================
 # Backups (Excel)
 # =====================================================
-def backup_rules_to_excel(mapping_rules: List[Dict], sum_rules: List[Dict]) -> Path:
+def backup_rules_to_excel(mapping_rules: List[Dict], expr_rules: Dict) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = BACKUP_DIR / f"rules_backup_{ts}.xlsx"
 
@@ -417,22 +368,32 @@ def backup_rules_to_excel(mapping_rules: List[Dict], sum_rules: List[Dict]) -> P
             "match_type": "매칭방식",
             "pattern": "실제상품명(패턴)",
             "display_name": "표시될상품명",
-            "note": "메모",
-        }
-    )
-    df_sum = sumrules_df_from_list(sum_rules).rename(
-        columns={
-            "enabled": "사용",
-            "match_type": "매칭방식",
-            "pattern": "제품명(패턴)",
             "sum_rule": "합산규칙(N)",
             "note": "메모",
         }
     )
 
+    units = expr_rules.get("units", [])
+    df_expr = pd.DataFrame(units)
+    if df_expr.empty:
+        df_expr = pd.DataFrame([{"enabled": True, "unit": expr_rules.get("default_unit", "개")}])
+    if "enabled" not in df_expr.columns:
+        df_expr["enabled"] = True
+    if "unit" not in df_expr.columns:
+        df_expr["unit"] = ""
+    df_expr = df_expr[["enabled", "unit"]].rename(columns={"enabled": "사용", "unit": "단위"})
+
+    df_meta = pd.DataFrame(
+        [
+            {"키": "default_unit", "값": expr_rules.get("default_unit", "개")},
+            {"키": "note", "값": expr_rules.get("note", "")},
+        ]
+    )
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         df_map.to_excel(writer, sheet_name="상품명매칭", index=False)
-        df_sum.to_excel(writer, sheet_name="합산규칙", index=False)
+        df_expr.to_excel(writer, sheet_name="표현규칙_단위", index=False)
+        df_meta.to_excel(writer, sheet_name="표현규칙_설정", index=False)
 
     return out_path
 
@@ -465,14 +426,10 @@ def find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
 
 
 # =====================================================
-# 합산규칙(개/봉/통/팩) 적용
+# 합산규칙(개/봉/통/팩 등 "표현규칙에서 켠 단위"에만 적용)
 # =====================================================
-BUNDLE_UNITS = {"개", "봉", "통", "팩"}
-BUNDLE_RE = re.compile(r"^\s*(\d+)\s*(개|봉|통|팩)\s*$")
-
-
-def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
-    m = BUNDLE_RE.match((variant or "").strip())
+def parse_bundle_variant(variant: str, bundle_re: re.Pattern) -> Tuple[Optional[int], Optional[str]]:
+    m = bundle_re.match((variant or "").strip())
     if not m:
         return None, None
     try:
@@ -481,11 +438,20 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
         return None, None
 
 
-def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
+def explode_sum_rule_rows(
+    df_rows: pd.DataFrame,
+    bundle_units: List[str],
+    default_unit: str,
+) -> pd.DataFrame:
     """
     df_rows columns: 제품명, 구분, 수량, 합산규칙
-    합산규칙은 개/봉/통/팩 단위에서만 분해됩니다.
+    합산규칙은 '표현규칙'에서 활성화된 단위(예: 개/봉/통/팩)에만 적용됩니다.
     """
+    bundle_units = bundle_units or [default_unit or "개"]
+    default_unit = default_unit or "개"
+    bundle_re = build_bundle_re(bundle_units)
+    unit_set = set(bundle_units)
+
     out = []
     for _, r in df_rows.iterrows():
         product = r["제품명"]
@@ -497,14 +463,16 @@ def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
+        # 구분이 비어 있으면 기본 단위 1개로 간주(표현규칙의 default_unit)
         if variant == "":
-            unit_size, unit_label = 1, "개"
-            is_bundle = True
+            unit_size, unit_label = 1, default_unit
+            is_bundle = unit_label in unit_set
         else:
-            unit_size, unit_label = parse_bundle_variant(variant)
-            is_bundle = (unit_size is not None and unit_label in BUNDLE_UNITS)
+            unit_size, unit_label = parse_bundle_variant(variant, bundle_re)
+            is_bundle = (unit_size is not None and unit_label in unit_set)
 
         if not is_bundle:
+            # kg/g 같은 건 그대로
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
@@ -697,7 +665,6 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
         name_token_plain = f"{recv} - "
         indent = _text_width_pt(name_token_plain, font_name, base_style.fontSize)
-
         indent_cap = usable_width * 0.55
         indent = min(max(indent, 40), indent_cap)
 
@@ -866,21 +833,9 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
 
 
 # =====================================================
-# Streamlit UI
+# Sidebar (상품명 매칭 규칙 메뉴에서만): 백업폴더 + 표현규칙
 # =====================================================
-st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_icon="📄", layout="wide")
-st.title("📄 제품별 개수 & 수취인별 출력")
-st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(새벽/익일) PDF + 스티커용지 PDF (엑셀 비밀번호 "0000" 고정)')
-
-menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
-st.sidebar.markdown("---")
-
-
-# -----------------------------
-# Sidebar: (상품명 매칭 규칙 메뉴에서만) 백업폴더 + 합산규칙 관리
-# -----------------------------
-def sidebar_backup_and_sumrules(mapping_rules: List[Dict], sum_rules: List[Dict]):
-    # 1) 백업폴더 (펼쳐보기 + 다운로드 + 삭제)
+def sidebar_backup_folder():
     with st.sidebar.expander("📁 규칙 백업폴더", expanded=False):
         try:
             backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -889,39 +844,53 @@ def sidebar_backup_and_sumrules(mapping_rules: List[Dict], sum_rules: List[Dict]
 
         if not backups:
             st.caption("아직 백업 파일이 없습니다.")
-        else:
-            for i, fp in enumerate(backups[:50]):
-                cols = st.columns([6, 2, 2])
-                cols[0].write(fp.name)
+            return
 
-                # 다운로드
+        for i, fp in enumerate(backups[:60]):
+            cols = st.columns([6, 2, 2])
+            cols[0].write(fp.name)
+
+            # 다운로드
+            try:
+                b = fp.read_bytes()
+                cols[1].download_button(
+                    "다운",
+                    data=b,
+                    file_name=fp.name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_bk_{i}_{fp.name}",
+                    use_container_width=True,
+                )
+            except Exception:
+                cols[1].write("")
+
+            # 삭제
+            if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
                 try:
-                    b = fp.read_bytes()
-                    cols[1].download_button(
-                        "다운",
-                        data=b,
-                        file_name=fp.name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"dl_bk_{i}_{fp.name}",
-                        use_container_width=True,
-                    )
-                except Exception:
-                    cols[1].write("")
+                    fp.unlink()
+                    st.success(f"삭제 완료: {fp.name}")
+                    st.rerun()
+                except Exception as e:
+                    st.error("삭제 실패")
+                    st.exception(e)
 
-                # 삭제
-                if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
-                    try:
-                        fp.unlink()
-                        st.success(f"삭제 완료: {fp.name}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error("삭제 실패")
-                        st.exception(e)
 
-    # 2) 합산규칙 편집 (펼쳐보기 + 수정/추가/삭제 + 저장)
-    with st.sidebar.expander("➕ 합산규칙 관리", expanded=False):
-        st.caption("※ 합산규칙은 개/봉/통/팩 단위에서만 분해/합산됩니다.")
-        df = sumrules_df_from_list(sum_rules)
+def sidebar_expression_rules():
+    expr = load_expression_rules()
+    units = expr.get("units", [])
+    default_unit = normalize_text(expr.get("default_unit", "개")) or "개"
+
+    with st.sidebar.expander("🧩 표현규칙", expanded=False):
+        st.caption("합산규칙(예: 5개씩 끊기)을 적용할 단위를 관리합니다. (통/개/팩/봉 등)")
+
+        df = pd.DataFrame(units)
+        if df.empty:
+            df = pd.DataFrame([{"enabled": True, "unit": default_unit}])
+        if "enabled" not in df.columns:
+            df["enabled"] = True
+        if "unit" not in df.columns:
+            df["unit"] = ""
+        df = df[["enabled", "unit"]]
 
         edited = st.data_editor(
             df,
@@ -930,41 +899,81 @@ def sidebar_backup_and_sumrules(mapping_rules: List[Dict], sum_rules: List[Dict]
             use_container_width=True,
             column_config={
                 "enabled": st.column_config.CheckboxColumn("사용", default=True),
-                "match_type": st.column_config.SelectboxColumn("매칭", options=["exact", "contains", "regex"]),
-                "pattern": st.column_config.TextColumn("제품명(패턴)"),
-                "sum_rule": st.column_config.NumberColumn("N", min_value=2, step=1),
-                "note": st.column_config.TextColumn("메모"),
+                "unit": st.column_config.TextColumn("단위"),
             },
-            key="sumrules_editor_sidebar",
+            key="expr_units_editor",
         )
 
-        if st.button("💾 합산규칙 저장", use_container_width=True, key="save_sumrules_btn"):
-            cleaned = sumrules_list_from_df(edited)
-            save_sum_rules(cleaned)
-            st.success(f"합산규칙 저장 완료 ({len(cleaned)}개)")
+        enabled_units = []
+        for _, r in edited.iterrows():
+            u = normalize_text(r.get("unit", ""))
+            if u:
+                enabled_units.append((bool(r.get("enabled", True)), u))
+
+        enabled_only = [u for en, u in enabled_units if en]
+        if not enabled_only:
+            enabled_only = ["개"]
+
+        if default_unit not in enabled_only:
+            default_unit = enabled_only[0]
+
+        new_default = st.selectbox(
+            "기본단위 (구분이 비어있을 때)",
+            options=enabled_only,
+            index=enabled_only.index(default_unit) if default_unit in enabled_only else 0,
+            key="expr_default_unit",
+        )
+
+        if st.button("💾 표현규칙 저장", use_container_width=True, key="save_expr_rules_btn"):
+            cleaned_units = []
+            seen = set()
+            for en, u in enabled_units:
+                if u in seen:
+                    continue
+                cleaned_units.append({"enabled": bool(en), "unit": u})
+                seen.add(u)
+
+            data = {
+                "default_unit": new_default,
+                "units": cleaned_units,
+                "note": expr.get("note", ""),
+            }
+            save_expression_rules(data)
+            st.success("표현규칙 저장 완료")
             st.rerun()
 
-        # 편의: 현재 적용 예시 한 줄
-        st.caption("예: 제품명=오렌지, N=5 → 8개 주문 시 5개 1개 + 3개 1개")
 
+# =====================================================
+# Streamlit UI
+# =====================================================
+st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_icon="📄", layout="wide")
+st.title("📄 제품별 개수 & 수취인별 출력")
+st.caption('엑셀 업로드 → (상품명 매칭/합산규칙/표현규칙) → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF (엑셀 비밀번호 "0000")')
+
+menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
+st.sidebar.markdown("---")
 
 # -----------------------------
-# 1) 규칙 관리
+# 1) 상품명 매칭 규칙
 # -----------------------------
 if menu == "🧩 상품명 매칭 규칙":
+    sidebar_backup_folder()
+    sidebar_expression_rules()
+
     mapping_rules = load_mapping_rules()
-    sum_rules = load_sum_rules(mapping_rules)
+    expr = load_expression_rules()
 
-    sidebar_backup_and_sumrules(mapping_rules, sum_rules)
-
-    st.subheader("실제 상품명 → 표시될 상품명")
+    st.subheader("실제 상품명 → 표시될 상품명 (합산규칙 포함)")
 
     st.markdown(
         """
 **매칭방식 설명**
-- **contains**: `패턴`이 `엑셀 상품명` 안에 **포함**되어 있으면 매칭
-- **exact**: `패턴`과 `엑셀 상품명`이 **완전히 동일**할 때만 매칭
-- **regex**: `패턴`을 **정규식**으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
+- **contains**: `패턴`이 `엑셀 상품명` 안에 포함되면 매칭
+- **exact**: `패턴`과 `엑셀 상품명`이 완전히 동일할 때만 매칭
+- **regex**: `패턴`을 정규식으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
+
+**합산규칙(N)**  
+- 예: N=5, 단위가 표현규칙에 포함된 경우(개/봉/통/팩 등) → 8개 주문 시 `5개 1개` + `3개 1개`로 표현
 """
     )
 
@@ -980,6 +989,7 @@ if menu == "🧩 상품명 매칭 규칙":
             "match_type": st.column_config.SelectboxColumn("매칭 방식", options=["contains", "exact", "regex"]),
             "pattern": st.column_config.TextColumn("실제 상품명(패턴)", width="large"),
             "display_name": st.column_config.TextColumn("표시될 상품명", width="medium"),
+            "sum_rule": st.column_config.NumberColumn("합산규칙(N)", min_value=2, step=1),
             "note": st.column_config.TextColumn("메모", width="large"),
         },
         key="mapping_editor_main",
@@ -996,12 +1006,9 @@ if menu == "🧩 상품명 매칭 규칙":
     with c2:
         if st.button("📗 엑셀로 저장하기(백업)", use_container_width=True):
             cleaned_map = mapping_list_from_df(edited)
-            # sumrules는 사이드바 에디터가 따로 있으니 현재 파일 기준 로드해서 같이 백업
-            cleaned_sum = load_sum_rules()
-            outp = backup_rules_to_excel(cleaned_map, cleaned_sum)
+            outp = backup_rules_to_excel(cleaned_map, expr)
             st.success(f"백업 저장 완료: {outp.name}")
             st.rerun()
-
 
 # -----------------------------
 # 2) 엑셀 업로드 & 결과
@@ -1048,7 +1055,9 @@ else:
         st.stop()
 
     mapping_rules = load_mapping_rules()
-    sum_rules = load_sum_rules(mapping_rules)
+    expr = load_expression_rules()
+    bundle_units = get_bundle_units(expr)
+    default_unit = normalize_text(expr.get("default_unit", "개")) or "개"
 
     work = raw_df[[col_buyer, col_recv, col_addr, col_opt, col_name, col_qty]].copy()
     work.columns = ["구매자명", "수취인명", "통합배송지", "옵션정보", "상품명", "수량"]
@@ -1060,13 +1069,16 @@ else:
     mapped = work["상품명"].apply(lambda x: apply_mapping(x, mapping_rules))
     work["제품명"] = mapped.apply(lambda t: t[0])
     work["매칭성공"] = mapped.apply(lambda t: t[1])
-
-    # ✅ 합산규칙은 "제품명" 기준으로 별도 적용
-    work["합산규칙"] = work["제품명"].apply(lambda p: apply_sum_rule(p, sum_rules))
+    work["합산규칙"] = mapped.apply(lambda t: t[2])
 
     base = work[(work["수량"].notna()) & (work["제품명"] != "")].copy()
 
-    exploded = explode_sum_rule_rows(base[["제품명", "구분", "수량", "합산규칙"]])
+    exploded = explode_sum_rule_rows(
+        base[["제품명", "구분", "수량", "합산규칙"]],
+        bundle_units=bundle_units,
+        default_unit=default_unit,
+    )
+
     summary = (
         exploded.groupby(["제품명", "구분"], as_index=False)["수량"]
         .sum()
@@ -1164,7 +1176,11 @@ else:
 
         rows = [{"제품명": p, "구분": v, "수량": q, "합산규칙": sr} for (p, v, sr), q in od.items()]
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
-        rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
+        rows_ex = explode_sum_rule_rows(
+            rows_df[["제품명", "구분", "수량", "합산규칙"]] if len(rows_df) else rows_df,
+            bundle_units=bundle_units,
+            default_unit=default_unit,
+        ) if len(rows_df) else rows_df
 
         od2 = OrderedDict()
         for _, rr in rows_ex.iterrows():
