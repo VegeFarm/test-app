@@ -2,12 +2,14 @@ import io
 import json
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict
 from collections import OrderedDict
 
 import pandas as pd
 import streamlit as st
+import openpyxl
 
 # -----------------------------
 # Excel decrypt
@@ -41,6 +43,7 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 # =====================================================
 # CONFIG
 # =====================================================
+KST = ZoneInfo("Asia/Seoul")
 EXCEL_PASSWORD = "0000"
 
 DATA_DIR = Path("data")
@@ -54,6 +57,9 @@ EXPR_RULES_PATH = DATA_DIR / "expression_rules.json"
 # ✅ 백업폴더
 BACKUP_DIR = DATA_DIR / "rules_backup"
 BACKUP_DIR.mkdir(exist_ok=True)
+
+# ✅ TC 주문 등록양식 기본 파일(레포/폴더에 같이 두면 자동 인식)
+TC_TEMPLATE_DEFAULT_PATH = Path("TC주문_등록양식.xlsx")
 
 # 수취인별 PDF 스타일
 RECIPIENT_FONT_SIZE = 12
@@ -72,6 +78,12 @@ STICKER_CELL_H_MM = 21.1
 STICKER_FONT_SIZE = 11
 STICKER_LEADING = 13
 
+# ✅ TC 양식 기본값
+TC_DEFAULT_PLACE = "문앞"  # "배송 받을 장소*" 기본값(필수 칼럼이라 기본값을 넣어둠)
+TC_PRODUCT_NAME_FIXED = "채소팜상품"
+TC_TYPE_DAWN = "자동"
+TC_TYPE_NEXT = "택배대행"
+
 
 # =====================================================
 # VARIANT(단위) 추출
@@ -80,7 +92,11 @@ UNIT_PATTERNS = [
     r"\d+(?:\.\d+)?kg\s*~\s*\d+(?:\.\d+)?kg",
     r"\d+(?:\.\d+)?kg",
     r"(?:약\s*)?\d+(?:\.\d+)?g",
-    r"\d+개", r"\d+통", r"\d+단", r"\d+봉", r"\d+팩",
+    r"\d+개",
+    r"\d+통",
+    r"\d+단",
+    r"\d+봉",
+    r"\d+팩",
 ]
 UNIT_RE = re.compile(r"(" + "|".join(UNIT_PATTERNS) + r")")
 
@@ -116,20 +132,57 @@ def _safe_int(v) -> Optional[int]:
         return None
 
 
+def _xml_escape(s: str) -> str:
+    s = str(s or "")
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _text_width_pt(text: str, font: str, size: float) -> float:
+    try:
+        w = pdfmetrics.stringWidth(text, font, size)
+        if not w or w <= 0:
+            return len(text) * size * 0.55
+        return w
+    except Exception:
+        return len(text) * size * 0.55
+
+
+def fmt_qty(x):
+    try:
+        x = float(x)
+        return int(x) if x.is_integer() else x
+    except Exception:
+        return x
+
+
+def _as_int_qty(v) -> int:
+    try:
+        f = float(v)
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return int(round(f))
+    except Exception:
+        return 0
+
+
 # =====================================================
-# 표현규칙 (단위: 통/개/팩/봉 등) - 관리용
+# 표현규칙 (통/개/팩/봉 같은 단위 관리)
 # =====================================================
 def default_expression_rules() -> Dict:
     return {
-        "default_unit": "개",  # 구분이 비어있을 때 기본 단위
+        "default_unit": "개",
         "units": [
             {"enabled": True, "unit": "개"},
             {"enabled": True, "unit": "봉"},
             {"enabled": True, "unit": "통"},
             {"enabled": True, "unit": "팩"},
         ],
-        "note": "표현규칙은 합산규칙(예: 5개씩 끊기) 적용 대상 단위를 정합니다.",
+        "note": "합산규칙(N)이 적용될 단위를 관리합니다.",
     }
+
+
+def save_expression_rules(data: Dict) -> None:
+    EXPR_RULES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_expression_rules() -> Dict:
@@ -141,11 +194,13 @@ def load_expression_rules() -> Dict:
         data = json.loads(EXPR_RULES_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise ValueError("invalid")
+
         if "units" not in data or not isinstance(data["units"], list):
             data["units"] = default_expression_rules()["units"]
+
         if "default_unit" not in data or not isinstance(data["default_unit"], str):
             data["default_unit"] = default_expression_rules()["default_unit"]
-        # 정리
+
         cleaned_units = []
         for r in data["units"]:
             u = normalize_text(r.get("unit", ""))
@@ -153,15 +208,12 @@ def load_expression_rules() -> Dict:
                 continue
             cleaned_units.append({"enabled": bool(r.get("enabled", True)), "unit": u})
         data["units"] = cleaned_units
+        data["default_unit"] = normalize_text(data.get("default_unit", "개")) or "개"
         return data
     except Exception:
         data = default_expression_rules()
         save_expression_rules(data)
         return data
-
-
-def save_expression_rules(data: Dict) -> None:
-    EXPR_RULES_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def get_bundle_units(expr: Dict) -> List[str]:
@@ -171,7 +223,7 @@ def get_bundle_units(expr: Dict) -> List[str]:
             u = normalize_text(r.get("unit", ""))
             if u:
                 units.append(u)
-    # 중복 제거(순서 유지)
+
     seen = set()
     out = []
     for u in units:
@@ -182,7 +234,6 @@ def get_bundle_units(expr: Dict) -> List[str]:
 
 
 def build_bundle_re(bundle_units: List[str]) -> re.Pattern:
-    # 예: ^\s*(\d+)\s*(개|봉|통|팩)\s*$
     if not bundle_units:
         bundle_units = ["개"]
     unit_alt = "|".join(map(re.escape, bundle_units))
@@ -190,17 +241,16 @@ def build_bundle_re(bundle_units: List[str]) -> re.Pattern:
 
 
 # =====================================================
-# RULES: 상품명 매칭규칙 (여기에 합산규칙 N 포함)
+# 상품명 매칭 규칙 (합산규칙 N 포함)
 # =====================================================
 def default_mapping_rules() -> List[Dict]:
-    # 규칙은 표의 위→아래 순서대로 적용되며, 첫 매칭 1개만 적용
     return [
         {
             "enabled": True,
             "match_type": "contains",
             "pattern": "와일드루꼴라",
             "display_name": "와일드",
-            "sum_rule": None,  # 예: 5 (개/봉/통/팩 단위에만 적용)
+            "sum_rule": None,
             "note": '예) "채소팜 와일드루꼴라 1kg ..." -> 와일드',
         },
         {
@@ -211,7 +261,6 @@ def default_mapping_rules() -> List[Dict]:
             "sum_rule": None,
             "note": '예) "채소팜 라디치오 1통 ..." -> 라디치오',
         },
-        # 예시
         {
             "enabled": False,
             "match_type": "contains",
@@ -221,6 +270,10 @@ def default_mapping_rules() -> List[Dict]:
             "note": "예) 오렌지 합산규칙=5",
         },
     ]
+
+
+def save_mapping_rules(rules: List[Dict]) -> None:
+    MAPPING_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_mapping_rules() -> List[Dict]:
@@ -254,10 +307,6 @@ def load_mapping_rules() -> List[Dict]:
     rules = default_mapping_rules()
     save_mapping_rules(rules)
     return rules
-
-
-def save_mapping_rules(rules: List[Dict]) -> None:
-    MAPPING_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optional[int]]:
@@ -426,7 +475,7 @@ def find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
 
 
 # =====================================================
-# 합산규칙(개/봉/통/팩 등 "표현규칙에서 켠 단위"에만 적용)
+# 합산규칙 적용 (표현규칙에서 켠 단위에만)
 # =====================================================
 def parse_bundle_variant(variant: str, bundle_re: re.Pattern) -> Tuple[Optional[int], Optional[str]]:
     m = bundle_re.match((variant or "").strip())
@@ -443,10 +492,6 @@ def explode_sum_rule_rows(
     bundle_units: List[str],
     default_unit: str,
 ) -> pd.DataFrame:
-    """
-    df_rows columns: 제품명, 구분, 수량, 합산규칙
-    합산규칙은 '표현규칙'에서 활성화된 단위(예: 개/봉/통/팩)에만 적용됩니다.
-    """
     bundle_units = bundle_units or [default_unit or "개"]
     default_unit = default_unit or "개"
     bundle_re = build_bundle_re(bundle_units)
@@ -463,7 +508,7 @@ def explode_sum_rule_rows(
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
-        # 구분이 비어 있으면 기본 단위 1개로 간주(표현규칙의 default_unit)
+        # 구분이 비어 있으면 기본 단위 1개로 간주(표현규칙 default_unit)
         if variant == "":
             unit_size, unit_label = 1, default_unit
             is_bundle = unit_label in unit_set
@@ -472,7 +517,6 @@ def explode_sum_rule_rows(
             is_bundle = (unit_size is not None and unit_label in unit_set)
 
         if not is_bundle:
-            # kg/g 같은 건 그대로
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
@@ -514,42 +558,6 @@ def decide_group_delivery(deliv_set: set) -> str:
     if "익일배송" in deliv_set:
         return "익일배송"
     return "기타"
-
-
-# =====================================================
-# PDF helpers
-# =====================================================
-def _xml_escape(s: str) -> str:
-    s = str(s or "")
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _text_width_pt(text: str, font: str, size: float) -> float:
-    try:
-        w = pdfmetrics.stringWidth(text, font, size)
-        if not w or w <= 0:
-            return len(text) * size * 0.55
-        return w
-    except Exception:
-        return len(text) * size * 0.55
-
-
-def fmt_qty(x):
-    try:
-        x = float(x)
-        return int(x) if x.is_integer() else x
-    except Exception:
-        return x
-
-
-def _as_int_qty(v) -> int:
-    try:
-        f = float(v)
-        if abs(f - round(f)) < 1e-9:
-            return int(round(f))
-        return int(round(f))
-    except Exception:
-        return 0
 
 
 # =====================================================
@@ -738,7 +746,7 @@ def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) ->
             line1 += ch
         else:
             break
-    rest = txt[len(line1):].strip()
+    rest = txt[len(line1) :].strip()
     if not rest:
         return [line1]
     if w(rest) <= max_w_pt:
@@ -833,6 +841,74 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
 
 
 # =====================================================
+# TC 주문_등록양식 자동 채우기
+# =====================================================
+def _norm_header(s: str) -> str:
+    s = str(s or "")
+    s = s.replace("*", "")
+    s = re.sub(r"\s+", "", s)
+    return s.strip().lower()
+
+
+def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> bytes:
+    """
+    template sheet: '양식'
+    header row: 1
+    data row start: 2
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+    if "양식" not in wb.sheetnames:
+        raise ValueError("TC 템플릿에 '양식' 시트가 없습니다.")
+    ws = wb["양식"]
+
+    headers = {}
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(1, col).value
+        if v is None:
+            continue
+        headers[_norm_header(v)] = col
+
+    def col_of(label_candidates: List[str]) -> int:
+        for cand in label_candidates:
+            key = _norm_header(cand)
+            if key in headers:
+                return headers[key]
+        raise KeyError(f"필수 헤더를 찾지 못했습니다: {label_candidates}")
+
+    c_req = col_of(["배송요청일", "배송요청일*"])
+    c_orderer = col_of(["주문자", "주문자*"])
+    c_receiver = col_of(["수령자", "수령자*"])
+    c_addr = col_of(["수령자도로명주소", "수령자 도로명 주소", "수령자 도로명 주소*"])
+    c_phone = col_of(["수령자연락처", "수령자 연락처", "수령자 연락처*"])
+    c_in = col_of(["출입방법", "출입 방법"])
+    c_prod = col_of(["상품명", "상품명*"])
+    c_type = col_of(["배송유형", "배송 유형", "배송 유형*"])
+    # 필수일 가능성이 높아 기본값 채움
+    try:
+        c_place = col_of(["배송받을장소", "배송 받을 장소", "배송 받을 장소*"])
+    except KeyError:
+        c_place = None
+
+    start_row = 2
+    for i, r in enumerate(rows):
+        rr = start_row + i
+        ws.cell(rr, c_req).value = r.get("배송요청일", "")
+        ws.cell(rr, c_orderer).value = r.get("주문자", "")
+        ws.cell(rr, c_receiver).value = r.get("수령자", "")
+        ws.cell(rr, c_addr).value = r.get("수령자도로명주소", "")
+        ws.cell(rr, c_phone).value = r.get("수령자연락처", "")
+        ws.cell(rr, c_in).value = r.get("출입방법", "")
+        ws.cell(rr, c_prod).value = r.get("상품명", "")
+        ws.cell(rr, c_type).value = r.get("배송유형", "")
+        if c_place is not None:
+            ws.cell(rr, c_place).value = r.get("배송받을장소", TC_DEFAULT_PLACE)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# =====================================================
 # Sidebar (상품명 매칭 규칙 메뉴에서만): 백업폴더 + 표현규칙
 # =====================================================
 def sidebar_backup_folder():
@@ -881,7 +957,7 @@ def sidebar_expression_rules():
     default_unit = normalize_text(expr.get("default_unit", "개")) or "개"
 
     with st.sidebar.expander("🧩 표현규칙", expanded=False):
-        st.caption("합산규칙(예: 5개씩 끊기)을 적용할 단위를 관리합니다. (통/개/팩/봉 등)")
+        st.caption("합산규칙(N)을 적용할 단위를 관리합니다. (통/개/팩/봉 등)")
 
         df = pd.DataFrame(units)
         if df.empty:
@@ -948,7 +1024,7 @@ def sidebar_expression_rules():
 # =====================================================
 st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_icon="📄", layout="wide")
 st.title("📄 제품별 개수 & 수취인별 출력")
-st.caption('엑셀 업로드 → (상품명 매칭/합산규칙/표현규칙) → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF (엑셀 비밀번호 "0000")')
+st.caption('엑셀 업로드 → (상품명 매칭/합산규칙/표현규칙) → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF + TC주문_등록양식 자동작성')
 
 menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
 st.sidebar.markdown("---")
@@ -973,7 +1049,7 @@ if menu == "🧩 상품명 매칭 규칙":
 - **regex**: `패턴`을 정규식으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
 
 **합산규칙(N)**  
-- 예: N=5, 단위가 표현규칙에 포함된 경우(개/봉/통/팩 등) → 8개 주문 시 `5개 1개` + `3개 1개`로 표현
+- N=5, 단위가 표현규칙에 포함된 경우(개/봉/통/팩 등) → 8개 주문 시 `5개 1개` + `3개 1개`로 표현
 """
     )
 
@@ -1014,7 +1090,7 @@ if menu == "🧩 상품명 매칭 규칙":
 # 2) 엑셀 업로드 & 결과
 # -----------------------------
 else:
-    st.subheader("엑셀 업로드 → 제품별 집계 + 수취인별 출력(새벽/익일 분리)")
+    st.subheader("엑셀 업로드 → 제품별 집계 + 수취인별 출력(새벽/익일 분리) + TC주문_등록양식 자동작성")
 
     if msoffcrypto is None:
         st.error("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가하고 재배포해 주세요.")
@@ -1022,8 +1098,12 @@ else:
 
     uploaded = st.file_uploader("비밀번호(0000) 엑셀 업로드 (.xlsx)", type=["xlsx"])
     if uploaded is None:
-        st.info("엑셀을 업로드하면 결과 표와 PDF 다운로드가 나타납니다.")
+        st.info("엑셀을 업로드하면 결과 표와 PDF/엑셀 다운로드가 나타납니다.")
         st.stop()
+
+    upload_day = datetime.now(KST).date()
+    req_day = upload_day + timedelta(days=1)
+    req_day_str = req_day.strftime("%Y-%m-%d")
 
     try:
         decrypted = decrypt_excel(uploaded.getvalue(), password=EXCEL_PASSWORD)
@@ -1040,6 +1120,10 @@ else:
     col_addr = find_col(raw_df, ["통합배송지", "배송지", "주소"])
     col_opt = find_col(raw_df, ["옵션정보", "옵션", "선택옵션"])
 
+    # ✅ TC용 추가 컬럼
+    col_recv_phone = find_col(raw_df, ["수취인연락처", "수령인연락처", "수취인 연락처", "수령인 연락처"])
+    col_msg = find_col(raw_df, ["배송메세지", "배송메시지", "배송 메시지", "배송 메세지", "배송요청사항", "요청사항"])
+
     missing = [k for k, v in {
         "상품명": col_name,
         "수량": col_qty,
@@ -1047,6 +1131,8 @@ else:
         "수취인명": col_recv,
         "통합배송지": col_addr,
         "옵션정보": col_opt,
+        "수취인연락처": col_recv_phone,
+        "배송메세지": col_msg,
     }.items() if v is None]
 
     if missing:
@@ -1059,8 +1145,8 @@ else:
     bundle_units = get_bundle_units(expr)
     default_unit = normalize_text(expr.get("default_unit", "개")) or "개"
 
-    work = raw_df[[col_buyer, col_recv, col_addr, col_opt, col_name, col_qty]].copy()
-    work.columns = ["구매자명", "수취인명", "통합배송지", "옵션정보", "상품명", "수량"]
+    work = raw_df[[col_buyer, col_recv, col_addr, col_recv_phone, col_msg, col_opt, col_name, col_qty]].copy()
+    work.columns = ["구매자명", "수취인명", "통합배송지", "수취인연락처", "배송메세지", "옵션정보", "상품명", "수량"]
 
     work["상품명"] = work["상품명"].astype(str)
     work["수량"] = pd.to_numeric(work["수량"], errors="coerce")
@@ -1095,7 +1181,7 @@ else:
     st.download_button(
         "⬇️ 제품별 개수 PDF 다운로드",
         data=summary_pdf,
-        file_name=f"제품별개수_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        file_name=f"제품별개수_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.pdf",
         mime="application/pdf",
         use_container_width=True,
     )
@@ -1128,13 +1214,13 @@ else:
     st.download_button(
         "⬇️ 스티커용지 PDF 다운로드",
         data=sticker_pdf,
-        file_name=f"스티커용지_65칸_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        file_name=f"스티커용지_65칸_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.pdf",
         mime="application/pdf",
         use_container_width=True,
     )
 
     # -----------------------------
-    # 수취인별 출력
+    # 수취인별 출력 + 그룹 배송구분
     # -----------------------------
     st.markdown("---")
     st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리")
@@ -1152,6 +1238,15 @@ else:
         .rename(columns={"배송구분": "그룹배송구분"})
     )
     base2 = base2.merge(grp_deliv, on=key_cols, how="left")
+
+    def _first_nonempty(series: pd.Series) -> str:
+        for v in series.tolist():
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return s
+        return ""
 
     def build_items_for_group(g: pd.DataFrame) -> Tuple[str, str]:
         g = g.sort_index()
@@ -1176,11 +1271,11 @@ else:
 
         rows = [{"제품명": p, "구분": v, "수량": q, "합산규칙": sr} for (p, v, sr), q in od.items()]
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
-        rows_ex = explode_sum_rule_rows(
-            rows_df[["제품명", "구분", "수량", "합산규칙"]] if len(rows_df) else rows_df,
-            bundle_units=bundle_units,
-            default_unit=default_unit,
-        ) if len(rows_df) else rows_df
+        rows_ex = (
+            explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]], bundle_units=bundle_units, default_unit=default_unit)
+            if len(rows_df)
+            else rows_df
+        )
 
         od2 = OrderedDict()
         for _, rr in rows_ex.iterrows():
@@ -1217,7 +1312,7 @@ else:
         st.download_button(
             "⬇️ 새벽배송 수취인별 PDF",
             data=dawn_pdf,
-            file_name=f"수취인별_새벽배송_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            file_name=f"수취인별_새벽배송_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -1228,10 +1323,104 @@ else:
         st.download_button(
             "⬇️ 익일배송 수취인별 PDF",
             data=next_pdf,
-            file_name=f"수취인별_익일배송_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+            file_name=f"수취인별_익일배송_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
+
+    # -----------------------------
+    # ✅ TC주문_등록양식 자동작성 (새벽/익일 각각)
+    # -----------------------------
+    st.markdown("---")
+    st.subheader("🧾 TC주문_등록양식 자동작성 (새벽배송 / 익일배송 각각 엑셀 생성)")
+
+    # 템플릿 파일: 기본(레포에 포함) 또는 업로드
+    tc_up = st.file_uploader("TC주문_등록양식.xlsx (선택) - 레포에 파일이 있으면 업로드 안 해도 됩니다", type=["xlsx"])
+    template_bytes = None
+    if tc_up is not None:
+        template_bytes = tc_up.getvalue()
+    elif TC_TEMPLATE_DEFAULT_PATH.exists():
+        template_bytes = TC_TEMPLATE_DEFAULT_PATH.read_bytes()
+
+    if template_bytes is None:
+        st.warning("TC주문_등록양식.xlsx 템플릿을 업로드하거나, 앱 폴더에 'TC주문_등록양식.xlsx' 파일을 넣어주세요.")
+    else:
+        # 그룹별로 1행 생성 (구매자/수취인/주소 기준)
+        # 필요 필드: 구매자명, 수취인명, 통합배송지, 수취인연락처, 배송메세지, 그룹배송구분
+        grp_info = (
+            base2.groupby(key_cols, as_index=False)
+            .agg(
+                그룹배송구분=("그룹배송구분", "first"),
+                수취인연락처=("수취인연락처", _first_nonempty),
+                배송메세지=("배송메세지", _first_nonempty),
+            )
+        )
+
+        def make_tc_rows(df: pd.DataFrame, ship: str) -> List[Dict[str, str]]:
+            out = []
+            for _, r in df.iterrows():
+                if ship == "새벽배송":
+                    ship_type = TC_TYPE_DAWN
+                else:
+                    ship_type = TC_TYPE_NEXT
+
+                out.append(
+                    {
+                        "배송요청일": req_day_str,
+                        "주문자": str(r["구매자명"] or "").strip(),
+                        "수령자": str(r["수취인명"] or "").strip(),
+                        "수령자도로명주소": str(r["통합배송지"] or "").strip(),
+                        "수령자연락처": str(r.get("수취인연락처", "") or "").strip(),
+                        "출입방법": str(r.get("배송메세지", "") or "").strip(),
+                        "상품명": TC_PRODUCT_NAME_FIXED,
+                        "배송유형": ship_type,
+                        "배송받을장소": TC_DEFAULT_PLACE,
+                    }
+                )
+            return out
+
+        dawn_df = grp_info[grp_info["그룹배송구분"] == "새벽배송"].copy()
+        next_df = grp_info[grp_info["그룹배송구분"] == "익일배송"].copy()
+        etc_count = int((grp_info["그룹배송구분"] == "기타").sum())
+
+        cols = st.columns(2)
+
+        with cols[0]:
+            st.write(f"새벽배송 행: {len(dawn_df)} (배송유형: {TC_TYPE_DAWN})")
+            if len(dawn_df):
+                try:
+                    dawn_rows = make_tc_rows(dawn_df, "새벽배송")
+                    out_bytes = build_tc_excel_bytes(template_bytes, dawn_rows)
+                    st.download_button(
+                        "⬇️ TC주문_등록양식(새벽배송) 엑셀 다운로드",
+                        data=out_bytes,
+                        file_name=f"TC주문_등록양식_새벽배송_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error("TC 엑셀 생성 실패(새벽배송)")
+                    st.exception(e)
+
+        with cols[1]:
+            st.write(f"익일배송 행: {len(next_df)} (배송유형: {TC_TYPE_NEXT})")
+            if len(next_df):
+                try:
+                    next_rows = make_tc_rows(next_df, "익일배송")
+                    out_bytes = build_tc_excel_bytes(template_bytes, next_rows)
+                    st.download_button(
+                        "⬇️ TC주문_등록양식(익일배송) 엑셀 다운로드",
+                        data=out_bytes,
+                        file_name=f"TC주문_등록양식_익일배송_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error("TC 엑셀 생성 실패(익일배송)")
+                    st.exception(e)
+
+        if etc_count:
+            st.info(f"옵션정보에서 새벽/익일로 분류되지 않은 그룹(기타) {etc_count}건은 TC 엑셀 생성에서 제외했습니다.")
 
     with st.expander("⚠️ 미매칭/누락 행 보기 (규칙 추가용)", expanded=False):
         bad = work[(work["매칭성공"] == False) | (work["수량"].isna())].copy()
