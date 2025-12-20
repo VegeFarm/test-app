@@ -50,15 +50,12 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
-
-# ✅ 표현규칙(단위 목록 + 기본단위)
 EXPR_RULES_PATH = DATA_DIR / "expression_rules.json"
 
-# ✅ 백업폴더
 BACKUP_DIR = DATA_DIR / "rules_backup"
 BACKUP_DIR.mkdir(exist_ok=True)
 
-# ✅ TC 주문 등록양식 기본 파일(레포/폴더에 같이 두면 자동 인식)
+# ✅ 레포(앱 폴더)에 "TC주문_등록양식.xlsx" 파일을 같이 올려두면 업로드 없이 자동 사용
 TC_TEMPLATE_DEFAULT_PATH = Path("TC주문_등록양식.xlsx")
 
 # 수취인별 PDF 스타일
@@ -80,9 +77,11 @@ STICKER_LEADING = 13
 
 # ✅ TC 양식 기본값
 TC_PRODUCT_NAME_FIXED = "채소팜상품"
-TC_TYPE_DAWN = "자동"
-TC_TYPE_NEXT = "택배대행"
 TC_ACCESS_FALLBACK = "경비실 호출"
+
+# 기본 배송유형 값(사이드바에서 바꿀 수 있음)
+TC_TYPE_DAWN_DEFAULT = "자동"
+TC_TYPE_NEXT_DEFAULT = "택배대행"
 
 
 # =====================================================
@@ -773,11 +772,6 @@ def _draw_center_text(c: canvas.Canvas, font_name: str, font_size: int, x_center
     t = c.beginText()
     t.setTextOrigin(x_left, y)
     t.setFont(font_name, font_size)
-    try:
-        t.setTextRenderMode(0)
-    except Exception:
-        pass
-
     t.textOut(txt)
     c.drawText(t)
 
@@ -847,8 +841,9 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
 
 # =====================================================
 # TC 주문_등록양식 자동 채우기
-#  - 정렬: 수취인별 출력 순서와 동일 (원본 등장 순)
-#  - 배송받을장소: 기입하지 않음(아예 건드리지 않음)
+#  - 템플릿 업로드 없이: 앱 폴더의 "TC주문_등록양식.xlsx" 사용
+#  - 정렬: 수취인별 출력 순서와 동일(원본 등장 순)
+#  - 배송받을장소: 기입하지 않음(건드리지 않음)
 #  - 출입방법: 공백이면 "경비실 호출"
 # =====================================================
 def _norm_header(s: str) -> str:
@@ -859,11 +854,6 @@ def _norm_header(s: str) -> str:
 
 
 def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> bytes:
-    """
-    template sheet: '양식'
-    header row: 1
-    data row start: 2
-    """
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
     if "양식" not in wb.sheetnames:
         raise ValueError("TC 템플릿에 '양식' 시트가 없습니다.")
@@ -904,7 +894,7 @@ def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> b
         ws.cell(rr, c_prod).value = r.get("상품명", "")
         ws.cell(rr, c_type).value = r.get("배송유형", "")
 
-        # ✅ 배송받을장소는 "기입하지 말아줘" -> 템플릿 값 유지 (아예 건드리지 않음)
+        # ✅ 배송받을장소는 "기입하지 말아줘" -> 템플릿 값을 유지 (아예 건드리지 않음)
 
     out = io.BytesIO()
     wb.save(out)
@@ -929,7 +919,6 @@ def sidebar_backup_folder():
             cols = st.columns([6, 2, 2])
             cols[0].write(fp.name)
 
-            # 다운로드
             try:
                 b = fp.read_bytes()
                 cols[1].download_button(
@@ -943,7 +932,6 @@ def sidebar_backup_folder():
             except Exception:
                 cols[1].write("")
 
-            # 삭제
             if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
                 try:
                     fp.unlink()
@@ -1099,6 +1087,26 @@ else:
         st.error("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가하고 재배포해 주세요.")
         st.stop()
 
+    # ✅ 이 페이지의 사이드바에만 TC 배송유형 직접 설정
+    if "tc_type_dawn" not in st.session_state:
+        st.session_state.tc_type_dawn = TC_TYPE_DAWN_DEFAULT
+    if "tc_type_next" not in st.session_state:
+        st.session_state.tc_type_next = TC_TYPE_NEXT_DEFAULT
+
+    with st.sidebar.expander("🧾 TC주문_등록 설정", expanded=False):
+        st.caption("새벽배송/익일배송일 때 TC 양식의 '배송유형' 값을 직접 설정합니다.")
+        st.session_state.tc_type_dawn = st.text_input(
+            "새벽배송 → 배송유형",
+            value=st.session_state.tc_type_dawn,
+            key="tc_type_dawn_input",
+        ).strip() or TC_TYPE_DAWN_DEFAULT
+
+        st.session_state.tc_type_next = st.text_input(
+            "익일배송 → 배송유형",
+            value=st.session_state.tc_type_next,
+            key="tc_type_next_input",
+        ).strip() or TC_TYPE_NEXT_DEFAULT
+
     uploaded = st.file_uploader("비밀번호(0000) 엑셀 업로드 (.xlsx)", type=["xlsx"])
     if uploaded is None:
         st.info("엑셀을 업로드하면 결과 표와 PDF/엑셀 다운로드가 나타납니다.")
@@ -1204,7 +1212,7 @@ else:
         if qty > 0:
             label_rows.append((label, qty))
 
-    label_rows.sort(key=lambda x: x[0])  # 스티커는 가나다 순 유지
+    label_rows.sort(key=lambda x: x[0])  # 스티커는 가나다 순
 
     sticker_texts: List[str] = []
     for label, qty in label_rows:
@@ -1327,23 +1335,17 @@ else:
         )
 
     # -----------------------------
-    # ✅ TC주문_등록양식 자동작성 (새벽/익일 각각)
-    #    - 정렬: 수취인별 출력 순서와 동일 (원본 등장 순)
+    # ✅ TC주문_등록양식 자동작성 (업로드 없이 템플릿 자동 사용)
     # -----------------------------
     st.markdown("---")
     st.subheader("🧾 TC주문_등록양식 자동작성 (새벽배송 / 익일배송 각각 엑셀 생성)")
 
-    tc_up = st.file_uploader("TC주문_등록양식.xlsx (선택) - 레포에 파일이 있으면 업로드 안 해도 됩니다", type=["xlsx"])
-    template_bytes = None
-    if tc_up is not None:
-        template_bytes = tc_up.getvalue()
-    elif TC_TEMPLATE_DEFAULT_PATH.exists():
+    if not TC_TEMPLATE_DEFAULT_PATH.exists():
+        st.error("앱 폴더에 'TC주문_등록양식.xlsx' 파일이 없습니다. GitHub에 이 파일을 app.py와 같이 올려주세요.")
+    else:
         template_bytes = TC_TEMPLATE_DEFAULT_PATH.read_bytes()
 
-    if template_bytes is None:
-        st.warning("TC주문_등록양식.xlsx 템플릿을 업로드하거나, 앱 폴더에 'TC주문_등록양식.xlsx' 파일을 넣어주세요.")
-    else:
-        # ✅ 수취인별 출력과 동일한 그룹 순서 확보 (등장 순)
+        # ✅ 수취인별 출력과 동일한 그룹 순서(등장 순)
         order_keys_df = base2[key_cols].drop_duplicates(keep="first").copy()
 
         def _first_nonempty(series: pd.Series) -> str:
@@ -1366,12 +1368,12 @@ else:
                 통합배송지=("통합배송지", "first"),
             )
         )
-        # order_keys_df에 agg 결과를 붙여서 "순서"를 강제
         grp_info = order_keys_df.merge(grp_info_agg, on=key_cols, how="left")
 
         def make_tc_rows(df: pd.DataFrame, ship: str) -> List[Dict[str, str]]:
             out = []
-            ship_type = TC_TYPE_DAWN if ship == "새벽배송" else TC_TYPE_NEXT
+            ship_type = st.session_state.tc_type_dawn if ship == "새벽배송" else st.session_state.tc_type_next
+            ship_type = (ship_type or "").strip() or (TC_TYPE_DAWN_DEFAULT if ship == "새벽배송" else TC_TYPE_NEXT_DEFAULT)
 
             for _, r in df.iterrows():
                 out.append(
@@ -1381,7 +1383,6 @@ else:
                         "수령자": str(r["수취인명"] or "").strip(),
                         "수령자도로명주소": str(r["통합배송지"] or "").strip(),
                         "수령자연락처": str(r.get("수취인연락처", "") or "").strip(),
-                        # ✅ 공백이면 "경비실 호출"
                         "출입방법": _clean_access_message(r.get("배송메세지", "")),
                         "상품명": TC_PRODUCT_NAME_FIXED,
                         "배송유형": ship_type,
@@ -1396,7 +1397,7 @@ else:
         cols = st.columns(2)
 
         with cols[0]:
-            st.write(f"새벽배송 행: {len(dawn_df)} (배송유형: {TC_TYPE_DAWN})")
+            st.write(f"새벽배송 행: {len(dawn_df)} (배송유형: {st.session_state.tc_type_dawn})")
             if len(dawn_df):
                 try:
                     dawn_rows = make_tc_rows(dawn_df, "새벽배송")
@@ -1413,7 +1414,7 @@ else:
                     st.exception(e)
 
         with cols[1]:
-            st.write(f"익일배송 행: {len(next_df)} (배송유형: {TC_TYPE_NEXT})")
+            st.write(f"익일배송 행: {len(next_df)} (배송유형: {st.session_state.tc_type_next})")
             if len(next_df):
                 try:
                     next_rows = make_tc_rows(next_df, "익일배송")
