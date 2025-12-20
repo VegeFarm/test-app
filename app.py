@@ -60,14 +60,10 @@ STICKER_PER_PAGE = STICKER_COLS * STICKER_ROWS  # 65
 STICKER_CELL_W_MM = 38.2
 STICKER_CELL_H_MM = 21.1
 
-# ✅ 스티커 텍스트 스타일
-STICKER_FONT_SIZE = 11     # 글자 크기(포인트)
-STICKER_LEADING = 11
-STICKER_BOLD = True
-
-# ✅ 깔끔한 Bold: fill + stroke 방식
-STICKER_BOLD_MODE = "stroke"
-STICKER_STROKE_WIDTH = 0.10  # 0.18~0.30 조절
+# ✅ 스티커 텍스트 스타일 (요청 반영)
+STICKER_FONT_SIZE = 11     # ← 11로 올림
+STICKER_LEADING = 13
+STICKER_BOLD = False       # ← Bold 제거
 
 
 # =====================================================
@@ -517,7 +513,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 
 # =====================================================
-# PDF 3) 스티커 용지 (가이드선 옵션 제거)
+# PDF 3) 스티커 용지 (Bold 제거 + 글자 11pt)
 # =====================================================
 def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) -> List[str]:
     txt = (txt or "").strip()
@@ -575,7 +571,6 @@ def _draw_center_text(
     x_center: float,
     y: float,
     txt: str,
-    bold: bool,
 ):
     txt = (txt or "").strip()
     if not txt:
@@ -587,22 +582,11 @@ def _draw_center_text(
     t = c.beginText()
     t.setTextOrigin(x_left, y)
     t.setFont(font_name, font_size)
-
-    if bold and STICKER_BOLD and STICKER_BOLD_MODE == "stroke":
-        try:
-            t.setTextRenderMode(2)  # fill + stroke
-            c.setStrokeColor(colors.black)
-            c.setLineWidth(float(STICKER_STROKE_WIDTH))
-        except Exception:
-            try:
-                t.setTextRenderMode(0)
-            except Exception:
-                pass
-    else:
-        try:
-            t.setTextRenderMode(0)
-        except Exception:
-            pass
+    # Bold 제거: 일반 출력
+    try:
+        t.setTextRenderMode(0)
+    except Exception:
+        pass
 
     t.textOut(txt)
     c.drawText(t)
@@ -656,13 +640,13 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
                 cx = x + cell_w_pt / 2.0
                 if len(lines) == 1:
                     cy = y + (cell_h_pt / 2.0) - (STICKER_FONT_SIZE * 0.35)
-                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, cy, lines[0], bold=True)
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, cy, lines[0])
                 else:
                     center = y + (cell_h_pt / 2.0)
                     upper_y = center + (STICKER_LEADING * 0.25)
                     lower_y = center - (STICKER_LEADING * 0.95)
-                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, upper_y, lines[0], bold=True)
-                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, lower_y, lines[1], bold=True)
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, upper_y, lines[0])
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, lower_y, lines[1])
 
         if p < page_count - 1:
             c.showPage()
@@ -863,7 +847,7 @@ else:
     )
 
     # -----------------------------
-    # 스티커 PDF: ✅ 가이드선 표시 옵션 제거
+    # 스티커 PDF (Bold 없음 / 11pt)
     # -----------------------------
     st.markdown("---")
     st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
@@ -886,7 +870,7 @@ else:
     pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
     st.caption(
         f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 "
-        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold={STICKER_BOLD})"
+        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold 없음)"
     )
 
     sticker_pdf = build_sticker_pdf(sticker_texts)
@@ -899,7 +883,7 @@ else:
     )
 
     # -----------------------------
-    # 수취인별 출력
+    # 수취인별 출력 (생략: 기존과 동일)
     # -----------------------------
     st.markdown("---")
     st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (수취인명 길이에 맞춰 옆에 붙이기)")
