@@ -392,7 +392,8 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 # =====================================================
 # PDF 2) 수취인별 출력
-#   ✅ 줄바꿈 시 "주문상품 시작 위치" 아래로 이어지게(2열 Table)
+#   ✅ 수취인명 길이에 "행별로" 맞춰 주문상품이 바로 옆에 붙음
+#   ✅ 줄바꿈 시 주문상품 시작 위치 아래로 이어짐 (행별 hanging indent)
 #   ✅ 글자 크기 고정, 자동 페이지 넘김, 블록 분리 금지
 # =====================================================
 def _xml_escape(s: str) -> str:
@@ -400,12 +401,20 @@ def _xml_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _text_width_pt(text: str, font: str, size: float) -> float:
+    try:
+        w = pdfmetrics.stringWidth(text, font, size)
+        # 일부 CID 폰트에서 0이 나오는 경우가 있어 fallback
+        if not w or w <= 0:
+            return len(text) * size * 0.55
+        return w
+    except Exception:
+        return len(text) * size * 0.55
+
+
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     """
     entries: [{"수취인명": "...", "items_line": "..."}]
-    - "수취인명 -" 과 주문상품을 같은 줄로 보이되,
-      줄바꿈 시에는 수취인명 밑이 아니라 '주문상품 시작 위치' 밑으로 이어지게 출력
-    - 글자 크기 고정, 자동 페이지 넘김, 블록 분리 금지
     """
     buf = io.BytesIO()
 
@@ -431,65 +440,46 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     )
 
     styles = getSampleStyleSheet()
-    name_style = ParagraphStyle(
-        "name",
+    base_style = ParagraphStyle(
+        "base",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=10,
-        leading=12,
-        spaceAfter=0,
-    )
-    item_style = ParagraphStyle(
-        "item",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=10,  # 고정
+        fontSize=10,   # ✅ 고정
         leading=12,
         spaceAfter=0,
     )
 
-    # 사용 가능한 가로폭(포인트)
     usable_width = A4[0] - left_margin - right_margin
-
-    # 1열(수취인명 -) 너비 동적(너무 넓어지지 않게 상한)
-    max_name_w = 0.0
-    for e in entries:
-        recv = (e.get("수취인명") or "").strip()
-        txt = f"{recv} -"
-        try:
-            w = pdfmetrics.stringWidth(txt, font_name, 10)
-        except Exception:
-            w = 90
-        max_name_w = max(max_name_w, w)
-
-    col1_w = max(70, min(max_name_w + 12, 190))  # pt
-    col2_w = max(usable_width - col1_w, 200)
 
     elems = []
     for e in entries:
         recv = (e.get("수취인명") or "").strip() or " "
         items = (e.get("items_line") or "").strip() or " "
 
-        p_name = Paragraph(f"<b>{_xml_escape(recv)}</b> -", name_style)
-        p_items = Paragraph(_xml_escape(items), item_style)
+        # ✅ 이 행의 "수취인명 - " 너비만큼, 다음 줄부터 그 위치(주문상품 시작점)로 들여쓰기
+        name_token = f"{recv} - "
+        indent = _text_width_pt(name_token, font_name, base_style.fontSize)
 
-        row = [[p_name, p_items]]
-        t = LongTable(row, colWidths=[col1_w, col2_w])
-        t.setStyle(
-            TableStyle(
-                [
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-                    ("TOPPADDING", (0, 0), (-1, -1), 0),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ]
-            )
+        # 너무 길게 잡히면(아주 긴 이름) 주문상품 공간이 너무 좁아지니 합리적 상한만 둠
+        indent_cap = usable_width * 0.55
+        indent = min(max(indent, 40), indent_cap)
+
+        line_style = ParagraphStyle(
+            f"line_{abs(hash(recv)) % 10_000_000}",
+            parent=base_style,
+            leftIndent=indent,
+            firstLineIndent=-indent,   # ✅ 첫 줄은 0에서 시작, 둘째 줄부터 indent 위치에서 시작
         )
+
+        # 한 문단으로 구성 (줄바꿈 시 hanging indent가 적용됨)
+        # NOTE: <b>는 일부 폰트에서 두께만 바뀌고 폭 계산과 차이가 날 수 있어,
+        #       들여쓰기 정확도가 중요하니 이름은 일반 텍스트로 처리.
+        text = f"{_xml_escape(recv)} - {_xml_escape(items)}"
+        p = Paragraph(text, line_style)
 
         block = KeepTogether(
             [
-                t,
+                p,
                 Spacer(1, 2.0 * mm),
                 HRFlowable(
                     width="100%",
@@ -711,7 +701,7 @@ else:
     # (B) 수취인별 출력 (새벽/익일 분리 + 새벽 우선)
     # -----------------------------
     st.markdown("---")
-    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (줄바꿈 정렬 개선)")
+    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (수취인명 길이에 맞춰 옆에 붙이기)")
 
     base2 = base.copy()
     base2["배송구분"] = base2["옵션정보"].apply(classify_delivery)
