@@ -95,14 +95,13 @@ def default_rules() -> List[Dict]:
             "sum_rule": None,
             "note": '예) "채소팜 라디치오 1통 ..." -> 라디치오',
         },
-        # 예시(필요 시 켜서 사용)
         {
             "enabled": False,
             "priority": 30,
             "match_type": "contains",
             "pattern": "오렌지",
             "display_name": "오렌지",
-            "sum_rule": 5,  # 5개/5봉/5통/5팩 묶음
+            "sum_rule": 5,
             "note": "합산규칙=5 예시 (개/봉/통/팩)",
         },
     ]
@@ -187,7 +186,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
                 sum_rule = None
             return display, True, sum_rule
 
-    # --- fallback: 브랜드/괄호 제거 + 단위 앞까지만 + 접두어 처리(생/유기농...) ---
+    # fallback
     s = re.sub(r"^\s*채소팜\s*", "", actual)
     s = re.sub(r"\([^)]*\)", "", s).strip()
     s = re.sub(r"\s+", " ", s).strip()
@@ -201,7 +200,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
 
     PREFIX = {"생", "유기농", "국산", "수입", "냉동", "베이비", "프리미엄"}
     if len(toks) >= 2 and toks[0] in PREFIX:
-        fallback = toks[0] + toks[1]  # 예: "생 아스파라거스" -> "생아스파라거스"
+        fallback = toks[0] + toks[1]
     else:
         fallback = toks[0]
 
@@ -253,12 +252,6 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
 
 
 def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
-    """
-    columns required: 제품명, 구분, 수량, 합산규칙
-    합산규칙(N)이 있는 경우:
-      - 구분이 (n개/봉/통/팩) 기반이면 총 단위를 N묶음 + 나머지(<=N)로 분해
-      - 구분이 비어있으면 1개로 가정(합산규칙 있을 때만)
-    """
     out = []
 
     for _, r in df_rows.iterrows():
@@ -271,7 +264,6 @@ def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
-        # 단위 판단
         if variant == "":
             unit_size, unit_label = 1, "개"
             is_bundle = True
@@ -316,7 +308,6 @@ def classify_delivery(opt: str) -> str:
 
 
 def decide_group_delivery(deliv_set: set) -> str:
-    # 새벽+익일 둘 다면 -> 새벽
     if "새벽배송" in deliv_set:
         return "새벽배송"
     if "익일배송" in deliv_set:
@@ -392,15 +383,20 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 
 # =====================================================
-# PDF 2) 수취인별 출력 (글자 크기 유지 / 자동 페이지 넘김 / 블록 분리 금지)
+# PDF 2) 수취인별 출력
+#   ✅ "수취인명 - 주문상품"을 같은 줄에 출력
+#   ✅ 글자 크기 고정, 자동 페이지 넘김, 블록 분리 금지
 # =====================================================
+def _xml_escape(s: str) -> str:
+    s = str(s or "")
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
+
+
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
-    """
-    entries: [{"name_line": "...", "items_line": "..."}]
-    - 글자 크기 고정(축소 없음)
-    - 한 페이지 20개 고정 없음
-    - 한 사람(2줄 블록)이 페이지 중간에서 쪼개지지 않음(KeepTogether)
-    """
     buf = io.BytesIO()
 
     font_name = "Helvetica"
@@ -420,37 +416,33 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     )
 
     styles = getSampleStyleSheet()
-    name_style = ParagraphStyle(
-        "name",
+    line_style = ParagraphStyle(
+        "line",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=10,  # 고정
+        fontSize=10,   # ✅ 고정
         leading=12,
-        spaceAfter=0,
-    )
-    item_style = ParagraphStyle(
-        "item",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=9,   # 고정
-        leading=11,
         spaceAfter=0,
     )
 
     elems = []
 
     for e in entries:
-        name_line = (e.get("name_line") or " ").strip() or " "
-        items_line = (e.get("items_line") or " ").strip() or " "
+        recv = (e.get("수취인명") or "").strip() or " "
+        items = (e.get("items_line") or "").strip()
 
-        p1 = Paragraph(name_line, name_style)
-        p2 = Paragraph(items_line, item_style)
+        # ✅ 한 줄에 붙여서 출력
+        # 길면 Paragraph가 자동 줄바꿈(글자 크기 줄이지 않음)
+        if items:
+            line = f"<b>{_xml_escape(recv)}</b> - {_xml_escape(items)}"
+        else:
+            line = f"<b>{_xml_escape(recv)}</b> -"
+
+        p = Paragraph(line, line_style)
 
         block = KeepTogether(
             [
-                p1,
-                Spacer(1, 1.2 * mm),
-                p2,
+                p,
                 Spacer(1, 2.0 * mm),
                 HRFlowable(
                     width="100%",
@@ -604,8 +596,6 @@ else:
         st.exception(e)
         st.stop()
 
-    # ✅ 원본 미리보기 없음(요청사항 유지)
-
     # 필요한 컬럼
     col_name = find_col(raw_df, ["상품명", "상품", "제품명"])
     col_qty = find_col(raw_df, ["수량", "주문수량", "구매수량", "개수"])
@@ -674,15 +664,13 @@ else:
     # (B) 수취인별 출력 (새벽/익일 분리 + 새벽 우선)
     # -----------------------------
     st.markdown("---")
-    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (글자 크기 고정, 자동 페이지 넘김)")
+    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (이름 옆에 주문상품 표시)")
 
     base2 = base.copy()
     base2["배송구분"] = base2["옵션정보"].apply(classify_delivery)
 
-    # 같은 주문자인지 판단 키: 구매자명 + 수취인명 + 통합배송지
     key_cols = ["구매자명", "수취인명", "통합배송지"]
 
-    # 그룹별 배송구분 결정(새벽 우선)
     grp_deliv = (
         base2.groupby(key_cols)["배송구분"]
         .agg(lambda x: set(x))
@@ -692,11 +680,9 @@ else:
     )
     base2 = base2.merge(grp_deliv, on=key_cols, how="left")
 
-    def build_items_for_group(g: pd.DataFrame) -> Tuple[str, List[Dict[str, str]]]:
-        # 엑셀 행 순서 최대한 유지
+    def build_items_for_group(g: pd.DataFrame) -> Tuple[str, str]:
         g = g.sort_index()
 
-        # (제품명, 구분, 합산규칙) 합산(순서 보존)
         od = OrderedDict()
         for _, r in g.iterrows():
             prod = str(r["제품명"]).strip()
@@ -707,7 +693,7 @@ else:
             if not prod:
                 continue
             if var == "":
-                var = "-"  # 슬래시 강제 출력 대비
+                var = "-"
 
             key = (prod, var, sr)
             if key not in od:
@@ -724,7 +710,6 @@ else:
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
         rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
 
-        # (제품명, 구분) 재합산(표시 순서 유지)
         od2 = OrderedDict()
         for _, r in rows_ex.iterrows():
             k2 = (str(r["제품명"]), str(r["구분"]))
@@ -735,25 +720,22 @@ else:
             except Exception:
                 pass
 
-        items = []
+        parts = []
         for (p, v), q in od2.items():
-            items.append({"제품명": p, "구분": v, "수량": fmt_qty(q)})
+            parts.append(f"{p}/{v} {fmt_qty(q)}")
 
         recv_name = str(g["수취인명"].iloc[0]).strip()
-        return recv_name, items
+        items_line = ", ".join(parts)
+        return recv_name, items_line
 
     group_entries = []
     for _, g in base2.groupby(key_cols, sort=False):
-        recv_name, items = build_items_for_group(g)
-        parts = [f"{it['제품명']}/{it['구분']} {it['수량']}" for it in items if it["제품명"]]
-        items_line = ", ".join(parts)
-
+        recv_name, items_line = build_items_for_group(g)
         group_entries.append(
             {
                 "그룹배송구분": str(g["그룹배송구분"].iloc[0]),
                 "수취인명": recv_name,
-                "name_line": f"{recv_name} -",
-                "items_line": items_line if items_line else " ",
+                "items_line": items_line if items_line else "",
             }
         )
 
