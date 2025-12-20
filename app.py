@@ -34,7 +34,6 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.lib.enums import TA_CENTER
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
@@ -64,8 +63,11 @@ STICKER_CELL_H_MM = 21.1
 # ✅ 스티커 텍스트 스타일
 STICKER_FONT_SIZE = 9     # 현재 글자 크기(포인트)
 STICKER_LEADING = 11
-STICKER_BOLD = True       # ✅ 굵게(가짜 Bold: 겹쳐그리기)
-STICKER_BOLD_OFFSET = 0.25  # pt (0.2~0.35 추천)
+STICKER_BOLD = True
+
+# ✅ 깔끔한 Bold: fill + stroke 방식(겹쳐그리기 제거)
+STICKER_BOLD_MODE = "stroke"    # "stroke" 권장
+STICKER_STROKE_WIDTH = 0.22     # 0.18~0.30 사이에서 조절 (지저분하면 더 낮추기)
 
 
 # =====================================================
@@ -525,23 +527,8 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 # =====================================================
 # PDF 3) 스티커 용지 (Canvas로 직접 그림)
-#   ✅ 페이지당 65칸(5x13) 무조건 출력 + Bold 지원
+#   ✅ 페이지당 65칸(5x13) 고정 + 깔끔한 Bold(Stroke)
 # =====================================================
-def _draw_center_bold(c: canvas.Canvas, x: float, y: float, txt: str):
-    """
-    중앙정렬 텍스트를 굵게(가짜 bold) 표현
-    """
-    if not STICKER_BOLD:
-        c.drawCentredString(x, y, txt)
-        return
-
-    o = float(STICKER_BOLD_OFFSET)
-    # 중심 1회 + 주변 2회 정도만 겹쳐 그려서 과도한 번짐 방지
-    c.drawCentredString(x, y, txt)
-    c.drawCentredString(x + o, y, txt)
-    c.drawCentredString(x, y + o, txt)
-
-
 def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) -> List[str]:
     """
     셀 내부에 들어가도록 최대 2줄로 래핑. 너무 길면 ... 처리
@@ -596,6 +583,52 @@ def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) ->
     return [line1, (trimmed + "...") if trimmed else "..."]
 
 
+def _draw_center_text(
+    c: canvas.Canvas,
+    font_name: str,
+    font_size: int,
+    x_center: float,
+    y: float,
+    txt: str,
+    bold: bool,
+):
+    """
+    가운데 정렬 텍스트를 출력.
+    bold=True이면 fill+stroke 방식(가능한 경우)으로 깔끔하게 두껍게 출력.
+    """
+    txt = (txt or "").strip()
+    if not txt:
+        return
+
+    w = _text_width_pt(txt, font_name, font_size)
+    x_left = x_center - (w / 2.0)
+
+    t = c.beginText()
+    t.setTextOrigin(x_left, y)
+    t.setFont(font_name, font_size)
+
+    if bold and STICKER_BOLD and STICKER_BOLD_MODE == "stroke":
+        # 2 = fill + stroke
+        try:
+            t.setTextRenderMode(2)
+            c.setStrokeColor(colors.black)
+            c.setLineWidth(float(STICKER_STROKE_WIDTH))
+        except Exception:
+            # setTextRenderMode가 없는 환경이면 그냥 일반 출력(깔끔 우선)
+            try:
+                t.setTextRenderMode(0)
+            except Exception:
+                pass
+    else:
+        try:
+            t.setTextRenderMode(0)
+        except Exception:
+            pass
+
+    t.textOut(txt)
+    c.drawText(t)
+
+
 def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     """
     A4 / 65칸(5x13) / 38.2x21.1mm
@@ -618,21 +651,19 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     grid_w_pt = cell_w_pt * STICKER_COLS
     grid_h_pt = cell_h_pt * STICKER_ROWS
 
-    # 가운데 정렬 (아래 기준)
+    # 가운데 정렬(아래 기준)
     x0 = (page_w_pt - grid_w_pt) / 2.0
     y0 = (page_h_pt - grid_h_pt) / 2.0
 
-    # 페이지당 65개씩
     total = len(label_texts)
     page_count = (total + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if total else 1
 
-    # 셀 안쪽 패딩(pt)
+    # 셀 안쪽 패딩
     pad_x = 2.0 * mm
     max_text_w = cell_w_pt - (pad_x * 2)
 
-    idx = 0
     for p in range(page_count):
-        # 그리드(가이드선)
+        # 가이드선(테두리)
         if show_grid:
             c.setLineWidth(0.3)
             c.setStrokeColor(colors.lightgrey)
@@ -647,10 +678,8 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
 
         for r in range(STICKER_ROWS):
             for col in range(STICKER_COLS):
-                # 페이지 칸 번호(0~64)
                 slot = r * STICKER_COLS + col
                 global_i = p * STICKER_PER_PAGE + slot
-
                 if global_i >= total:
                     continue
 
@@ -659,24 +688,22 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
                 x = x0 + col * cell_w_pt
                 y = y0 + (STICKER_ROWS - 1 - r) * cell_h_pt
 
-                # 가운데 정렬 (최대 2줄)
+                # 최대 2줄
                 lines = _wrap_for_cell(text, font_name, STICKER_FONT_SIZE, max_text_w)[:2]
 
-                # 세로 가운데
                 cx = x + cell_w_pt / 2.0
                 if len(lines) == 1:
                     cy = y + (cell_h_pt / 2.0) - (STICKER_FONT_SIZE * 0.35)
-                    _draw_center_bold(c, cx, cy, lines[0])
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, cy, lines[0], bold=True)
                 else:
                     center = y + (cell_h_pt / 2.0)
                     upper_y = center + (STICKER_LEADING * 0.25)
                     lower_y = center - (STICKER_LEADING * 0.95)
-                    _draw_center_bold(c, cx, upper_y, lines[0])
-                    _draw_center_bold(c, cx, lower_y, lines[1])
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, upper_y, lines[0], bold=True)
+                    _draw_center_text(c, font_name, STICKER_FONT_SIZE, cx, lower_y, lines[1], bold=True)
 
         if p < page_count - 1:
             c.showPage()
-            c.setFont(font_name, STICKER_FONT_SIZE)
 
     c.save()
     return buf.getvalue()
@@ -879,7 +906,7 @@ else:
     )
 
     # -----------------------------
-    # (A-2) 스티커 용지 PDF (65칸 고정 + Bold)
+    # (A-2) 스티커 용지 PDF (65칸 고정 + 깔끔한 Bold)
     # -----------------------------
     st.markdown("---")
     st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
@@ -895,7 +922,7 @@ else:
         if var in ("", "-", "nan", "None"):
             label = name
         else:
-            # ✅ 요청: 제품명 + 구분 합치기(공백 없이) 예: 가지1개, 건대추500g
+            # 제품명 + 구분 합치기(공백 없이) 예: 가지1개, 건대추500g
             label = f"{name}{var}"
 
         qty = _as_int_qty(r["수량"])
@@ -911,7 +938,7 @@ else:
     pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
     st.caption(
         f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 "
-        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold={STICKER_BOLD})"
+        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold={STICKER_BOLD} / mode={STICKER_BOLD_MODE})"
     )
 
     sticker_pdf = build_sticker_pdf(sticker_texts, show_grid=show_grid)
@@ -974,18 +1001,18 @@ else:
         rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
 
         od2 = OrderedDict()
-        for _, r in rows_ex.iterrows():
-            k2 = (str(r["제품명"]), str(r["구분"]))
+        for _, rr in rows_ex.iterrows():
+            k2 = (str(rr["제품명"]), str(rr["구분"]))
             if k2 not in od2:
                 od2[k2] = 0.0
             try:
-                od2[k2] += float(r["수량"])
+                od2[k2] += float(rr["수량"])
             except Exception:
                 pass
 
         parts = []
-        for (p, v), q in od2.items():
-            parts.append(f"{p}/{v} {fmt_qty(q)}")
+        for (pname, v), q2 in od2.items():
+            parts.append(f"{pname}/{v} {fmt_qty(q2)}")
 
         recv_name = str(g["수취인명"].iloc[0]).strip()
         items_line = ", ".join(parts)
