@@ -67,7 +67,7 @@ STICKER_BOLD = True
 
 # ✅ 깔끔한 Bold: fill + stroke 방식
 STICKER_BOLD_MODE = "stroke"
-STICKER_STROKE_WIDTH = 0.22  # 0.18~0.30 조절
+STICKER_STROKE_WIDTH = 0.12  # 0.18~0.30 조절
 
 
 # =====================================================
