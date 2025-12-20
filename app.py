@@ -21,7 +21,13 @@ except ModuleNotFoundError:
 # PDF
 # -----------------------------
 from reportlab.platypus import (
-    SimpleDocTemplate, LongTable, TableStyle, Paragraph, Spacer, KeepInFrame, PageBreak
+    SimpleDocTemplate,
+    LongTable,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    KeepTogether,
+    HRFlowable,
 )
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -96,7 +102,7 @@ def default_rules() -> List[Dict]:
             "match_type": "contains",
             "pattern": "오렌지",
             "display_name": "오렌지",
-            "sum_rule": 5,
+            "sum_rule": 5,  # 5개/5봉/5통/5팩 묶음
             "note": "합산규칙=5 예시 (개/봉/통/팩)",
         },
     ]
@@ -249,6 +255,9 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
 def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
     """
     columns required: 제품명, 구분, 수량, 합산규칙
+    합산규칙(N)이 있는 경우:
+      - 구분이 (n개/봉/통/팩) 기반이면 총 단위를 N묶음 + 나머지(<=N)로 분해
+      - 구분이 비어있으면 1개로 가정(합산규칙 있을 때만)
     """
     out = []
 
@@ -264,7 +273,7 @@ def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
 
         # 단위 판단
         if variant == "":
-            unit_size, unit_label = 1, "개"  # 비어있으면 1개로 가정(합산규칙 있을 때만)
+            unit_size, unit_label = 1, "개"
             is_bundle = True
         else:
             unit_size, unit_label = parse_bundle_variant(variant)
@@ -383,12 +392,14 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 
 # =====================================================
-# PDF 2) 수취인명 - 주문상품 (2줄) / 20개 per page
+# PDF 2) 수취인별 출력 (글자 크기 유지 / 자동 페이지 넘김 / 블록 분리 금지)
 # =====================================================
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     """
-    entries: [{"name_line": "...", "items_line": "..."}]  # 2줄 구성
-    A4 1페이지 20개, 각 2줄
+    entries: [{"name_line": "...", "items_line": "..."}]
+    - 글자 크기 고정(축소 없음)
+    - 한 페이지 20개 고정 없음
+    - 한 사람(2줄 블록)이 페이지 중간에서 쪼개지지 않음(KeepTogether)
     """
     buf = io.BytesIO()
 
@@ -413,7 +424,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         "name",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=10,
+        fontSize=10,  # 고정
         leading=12,
         spaceAfter=0,
     )
@@ -421,59 +432,50 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         "item",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=9,
+        fontSize=9,   # 고정
         leading=11,
         spaceAfter=0,
     )
 
     elems = []
 
-    PER_PAGE = 20
-    row_h = 13.0 * mm  # 2줄 기준 고정 높이(길면 shrink)
+    for e in entries:
+        name_line = (e.get("name_line") or " ").strip() or " "
+        items_line = (e.get("items_line") or " ").strip() or " "
 
-    def make_cell(name_line: str, items_line: str):
         p1 = Paragraph(name_line, name_style)
         p2 = Paragraph(items_line, item_style)
-        kif = KeepInFrame(0, row_h - 2, [p1, p2], mode="shrink", hAlign="LEFT", vAlign="TOP")
-        return kif
 
-    # 페이지 단위로 테이블 생성
-    for start in range(0, len(entries), PER_PAGE):
-        chunk = entries[start:start + PER_PAGE]
-
-        data = []
-        for e in chunk:
-            data.append([make_cell(e["name_line"], e["items_line"])])
-
-        # 마지막 페이지가 20개 미만이면 빈 줄 채워서 20개 맞춤(요청대로)
-        while len(data) < PER_PAGE:
-            data.append([make_cell(" ", " ")])
-
-        table = LongTable(
-            data,
-            colWidths=[A4[0] - (24 * mm)],
-            rowHeights=[row_h] * PER_PAGE,
-            repeatRows=0,
+        block = KeepTogether(
+            [
+                p1,
+                Spacer(1, 1.2 * mm),
+                p2,
+                Spacer(1, 2.0 * mm),
+                HRFlowable(
+                    width="100%",
+                    thickness=0.4,
+                    color=colors.lightgrey,
+                    spaceBefore=0,
+                    spaceAfter=2.0 * mm,
+                ),
+            ]
         )
-        table.setStyle(
-            TableStyle(
-                [
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-                    ("TOPPADDING", (0, 0), (-1, -1), 2),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                    ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.lightgrey),
-                ]
-            )
-        )
-
-        elems.append(table)
-        if start + PER_PAGE < len(entries):
-            elems.append(PageBreak())
+        elems.append(block)
 
     doc.build(elems)
     return buf.getvalue()
+
+
+# =====================================================
+# Helpers
+# =====================================================
+def fmt_qty(x):
+    try:
+        x = float(x)
+        return int(x) if x.is_integer() else x
+    except Exception:
+        return x
 
 
 # =====================================================
@@ -481,7 +483,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 # =====================================================
 st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_icon="📄", layout="wide")
 st.title("📄 제품별 개수 & 수취인별 출력")
-st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(20개/페이지) PDF (엑셀 비밀번호 "0000" 고정)')
+st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별 PDF (엑셀 비밀번호 "0000" 고정)')
 
 menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
 st.sidebar.markdown("---")
@@ -583,7 +585,7 @@ if menu == "🧩 상품명 매칭 규칙":
 # 2) 엑셀 업로드 & 결과
 # -----------------------------
 else:
-    st.subheader("엑셀 업로드 → 제품별 집계 + 수취인별(20개/페이지) 출력")
+    st.subheader("엑셀 업로드 → 제품별 집계 + 수취인별 출력(새벽/익일 분리)")
 
     if msoffcrypto is None:
         st.error("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가하고 재배포해 주세요.")
@@ -602,7 +604,7 @@ else:
         st.exception(e)
         st.stop()
 
-    # ✅ 원본 미리보기 기능 삭제(요청사항)
+    # ✅ 원본 미리보기 없음(요청사항 유지)
 
     # 필요한 컬럼
     col_name = find_col(raw_df, ["상품명", "상품", "제품명"])
@@ -613,7 +615,12 @@ else:
     col_opt = find_col(raw_df, ["옵션정보", "옵션", "선택옵션"])
 
     missing = [k for k, v in {
-        "상품명": col_name, "수량": col_qty, "구매자명": col_buyer, "수취인명": col_recv, "통합배송지": col_addr, "옵션정보": col_opt
+        "상품명": col_name,
+        "수량": col_qty,
+        "구매자명": col_buyer,
+        "수취인명": col_recv,
+        "통합배송지": col_addr,
+        "옵션정보": col_opt,
     }.items() if v is None]
 
     if missing:
@@ -637,32 +644,23 @@ else:
     work["합산규칙"] = mapped.apply(lambda t: t[2])
 
     # -----------------------------
-    # (A) 제품별 집계 (기존 결과)
+    # (A) 제품별 집계
     # -----------------------------
     base = work[(work["수량"].notna()) & (work["제품명"] != "")].copy()
-    exploded = explode_sum_rule_rows(base[["제품명", "구분", "수량", "합산규칙"]])
 
+    exploded = explode_sum_rule_rows(base[["제품명", "구분", "수량", "합산규칙"]])
     summary = (
         exploded.groupby(["제품명", "구분"], as_index=False)["수량"]
         .sum()
         .sort_values(["제품명", "구분"], kind="mergesort")
         .reset_index(drop=True)
     )
-
-    def fmt_qty(x):
-        try:
-            x = float(x)
-            return int(x) if x.is_integer() else x
-        except Exception:
-            return x
-
     summary["수량"] = summary["수량"].apply(fmt_qty)
 
     st.markdown("---")
     st.subheader("✅ 결과 (제품명 / 구분 / 수량)")
     st.dataframe(summary, use_container_width=True, height=520)
 
-    # 제품별 PDF
     summary_pdf = build_summary_pdf(summary)
     st.download_button(
         "⬇️ 제품별 개수 PDF 다운로드",
@@ -676,13 +674,12 @@ else:
     # (B) 수취인별 출력 (새벽/익일 분리 + 새벽 우선)
     # -----------------------------
     st.markdown("---")
-    st.subheader("📄 수취인별 출력 (A4 / 20개씩 / 2줄) - 새벽배송 / 익일배송 분리")
+    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (글자 크기 고정, 자동 페이지 넘김)")
 
-    # 배송 분류
     base2 = base.copy()
     base2["배송구분"] = base2["옵션정보"].apply(classify_delivery)
 
-    # 같은 주문자 그룹 키: 구매자명 + 수취인명 + 통합배송지
+    # 같은 주문자인지 판단 키: 구매자명 + 수취인명 + 통합배송지
     key_cols = ["구매자명", "수취인명", "통합배송지"]
 
     # 그룹별 배송구분 결정(새벽 우선)
@@ -693,18 +690,13 @@ else:
         .reset_index()
         .rename(columns={"배송구분": "그룹배송구분"})
     )
-
     base2 = base2.merge(grp_deliv, on=key_cols, how="left")
 
-    # 그룹 단위로 아이템 문자열 만들기
     def build_items_for_group(g: pd.DataFrame) -> Tuple[str, List[Dict[str, str]]]:
-        """
-        return: (수취인명, items_list dicts)  # items_list는 최종 explode후 집계된 품목들
-        """
-        # 원본 순서 유지(엑셀 행 순서)
+        # 엑셀 행 순서 최대한 유지
         g = g.sort_index()
 
-        # (제품명, 구분, 합산규칙) 단위로 합산 (순서 보존)
+        # (제품명, 구분, 합산규칙) 합산(순서 보존)
         od = OrderedDict()
         for _, r in g.iterrows():
             prod = str(r["제품명"]).strip()
@@ -715,8 +707,7 @@ else:
             if not prod:
                 continue
             if var == "":
-                # 구분이 없으면 표시용으로 "-" (슬래시 강제 때문에 빈칸 방지)
-                var = "-"
+                var = "-"  # 슬래시 강제 출력 대비
 
             key = (prod, var, sr)
             if key not in od:
@@ -731,10 +722,9 @@ else:
             rows.append({"제품명": prod, "구분": var, "수량": q, "합산규칙": sr})
 
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
-        # 합산규칙 행 분해(개/봉/통/팩만)
         rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
 
-        # 다시 (제품명, 구분)으로 합산 (표시 순서는 가능한 유지)
+        # (제품명, 구분) 재합산(표시 순서 유지)
         od2 = OrderedDict()
         for _, r in rows_ex.iterrows():
             k2 = (str(r["제품명"]), str(r["구분"]))
@@ -752,11 +742,9 @@ else:
         recv_name = str(g["수취인명"].iloc[0]).strip()
         return recv_name, items
 
-    # 그룹 엔트리 생성
     group_entries = []
     for _, g in base2.groupby(key_cols, sort=False):
         recv_name, items = build_items_for_group(g)
-        # 주문상품 문자열: "상품/구분 수량, 상품/구분 수량"
         parts = [f"{it['제품명']}/{it['구분']} {it['수량']}" for it in items if it["제품명"]]
         items_line = ", ".join(parts)
 
@@ -769,7 +757,6 @@ else:
             }
         )
 
-    # 새벽/익일로 분리 (새벽 우선 규칙은 그룹배송구분으로 이미 반영됨)
     dawn_entries = [e for e in group_entries if e["그룹배송구분"] == "새벽배송"]
     next_entries = [e for e in group_entries if e["그룹배송구분"] == "익일배송"]
 
@@ -778,7 +765,7 @@ else:
         st.write(f"새벽배송: {len(dawn_entries)}명")
         dawn_pdf = build_recipient_pdf(dawn_entries)
         st.download_button(
-            "⬇️ 새벽배송 수취인별 PDF (20개/페이지)",
+            "⬇️ 새벽배송 수취인별 PDF",
             data=dawn_pdf,
             file_name=f"수취인별_새벽배송_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
@@ -789,7 +776,7 @@ else:
         st.write(f"익일배송: {len(next_entries)}명")
         next_pdf = build_recipient_pdf(next_entries)
         st.download_button(
-            "⬇️ 익일배송 수취인별 PDF (20개/페이지)",
+            "⬇️ 익일배송 수취인별 PDF",
             data=next_pdf,
             file_name=f"수취인별_익일배송_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
             mime="application/pdf",
