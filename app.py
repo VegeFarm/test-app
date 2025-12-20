@@ -1,25 +1,74 @@
-# app.py
+import io
 import json
 import re
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-# =========================
-# 저장 경로
-# =========================
+# 엑셀(비번) 복호화
+import msoffcrypto
+
+# PDF 생성
+from reportlab.platypus import SimpleDocTemplate, LongTable, TableStyle, Paragraph, Spacer
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+
+# =====================================================
+# 저장 경로 (매칭 규칙)
+# =====================================================
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
 
 
-# =========================
+# =====================================================
+# 단위(구분) 추출 정규식
+# - 상품명 안의 g/kg/개/통/단/봉/팩 등을 찾아 "구분"으로 사용
+# - (약350g) 같은 형태도 잡도록 "약" 허용
+# =====================================================
+UNIT_PATTERNS = [
+    r"\d+(?:\.\d+)?kg\s*~\s*\d+(?:\.\d+)?kg",  # 1.8kg~2kg
+    r"\d+(?:\.\d+)?kg",                        # 1kg, 1.5kg
+    r"(?:약\s*)?\d+(?:\.\d+)?g",               # 500g, 약350g
+    r"\d+개",
+    r"\d+통",
+    r"\d+단",
+    r"\d+봉",
+    r"\d+팩",
+]
+UNIT_RE = re.compile(r"(" + "|".join(UNIT_PATTERNS) + r")")
+
+
+def extract_variant(name: str) -> str:
+    """상품명에서 구분(단위)을 하나 추출"""
+    s = (name or "").strip()
+    m = UNIT_RE.search(s)
+    if not m:
+        return ""
+
+    u = m.group(0)
+    u = re.sub(r"\s+", "", u)       # 공백 제거
+    u = u.replace("약", "")          # '약350g' -> '350g'
+
+    # 범위: 1.8kg~2kg -> 오른쪽(2kg) 사용
+    if "~" in u:
+        u = u.split("~", 1)[1]
+
+    return u
+
+
+# =====================================================
 # 매칭 규칙 로드/세이브
-# =========================
+# =====================================================
 def default_rules():
-    # ✅ 예시를 "포함" 규칙으로 넣어두면
-    #    1kg/500g/250g 같은 옵션이 달라도 한 번에 묶입니다.
+    # 요청 예시를 기본값으로 넣어둠
     return [
         {
             "enabled": True,
@@ -27,7 +76,7 @@ def default_rules():
             "match_type": "contains",
             "pattern": "와일드루꼴라",
             "display_name": "와일드",
-            "note": "채소팜 와일드루꼴라 1kg/500g/250g ... 모두 와일드로",
+            "note": '예) "채소팜 와일드루꼴라 1kg 베이비루꼴라" -> 와일드',
         },
         {
             "enabled": True,
@@ -35,7 +84,7 @@ def default_rules():
             "match_type": "contains",
             "pattern": "라디치오",
             "display_name": "라디치오",
-            "note": "채소팜 라디치오 1통 이탈리안치커리 (약350g)",
+            "note": '예) "채소팜 라디치오 1통 이탈리안치커리 (약350g)" -> 라디치오',
         },
     ]
 
@@ -53,7 +102,6 @@ def load_rules() -> list[dict]:
     except Exception:
         pass
 
-    # 파일이 깨졌거나 형식이 이상하면 기본값 복구
     rules = default_rules()
     save_rules(rules)
     return rules
@@ -66,19 +114,21 @@ def save_rules(rules: list[dict]) -> None:
     )
 
 
-# =========================
-# 매칭 로직
-# =========================
 def normalize_text(s: str) -> str:
-    return (s or "").strip()
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-def apply_mapping(actual_name: str, rules: list[dict]) -> str:
+def apply_mapping(actual_name: str, rules: list[dict]) -> tuple[str, bool]:
+    """
+    실제 상품명 -> 표시될 상품명
+    반환: (표시명, 매칭성공여부)
+    """
     actual = normalize_text(actual_name)
     if not actual:
-        return ""
+        return "", False
 
-    # priority 오름차순(작을수록 먼저 적용)
     def prio(x):
         try:
             return int(x.get("priority", 9999))
@@ -89,7 +139,7 @@ def apply_mapping(actual_name: str, rules: list[dict]) -> str:
         if not r.get("enabled", True):
             continue
 
-        match_type = (r.get("match_type") or "").strip()
+        match_type = (r.get("match_type") or "contains").strip()
         pattern = normalize_text(r.get("pattern", ""))
         display = normalize_text(r.get("display_name", ""))
 
@@ -98,55 +148,160 @@ def apply_mapping(actual_name: str, rules: list[dict]) -> str:
 
         if match_type == "exact":
             if actual == pattern:
-                return display
+                return display, True
 
         elif match_type == "contains":
             if pattern in actual:
-                return display
+                return display, True
 
         elif match_type == "regex":
             try:
                 if re.search(pattern, actual):
-                    return display
+                    return display, True
             except re.error:
-                # 정규식이 깨져있으면 그냥 무시
                 continue
 
-    # 규칙에 안 걸리면 원본 그대로
-    return actual
+    # 미매칭이면 원본에서 브랜드/괄호 제거 후 첫 토큰 정도로 fallback (너무 지저분해지는 것 방지)
+    s = re.sub(r"^\s*채소팜\s*", "", actual)
+    s = re.sub(r"\([^)]*\)", "", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    # 단위 이전까지만 잘라서 첫 토큰 반환
+    m = UNIT_RE.search(s)
+    if m:
+        s = s[: m.start()].strip()
+    fallback = s.split(" ")[0] if s else actual
+    return fallback, False
 
 
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title="상품명 매칭 규칙 관리", page_icon="🧩", layout="wide")
-st.title("🧩 상품명 매칭 규칙 관리")
+# =====================================================
+# 엑셀(비번 0000) 로드
+# =====================================================
+EXCEL_PASSWORD = "0000"
 
-rules = load_rules()
 
-menu = st.sidebar.radio(
-    "메뉴",
-    ["📌 상품명 매칭 관리", "🧪 매칭 테스트"],
-    index=0,
-)
+def decrypt_excel(uploaded_bytes: bytes, password: str = EXCEL_PASSWORD) -> io.BytesIO:
+    decrypted = io.BytesIO()
+    office = msoffcrypto.OfficeFile(io.BytesIO(uploaded_bytes))
+    office.load_key(password=password)
+    office.decrypt(decrypted)
+    decrypted.seek(0)
+    return decrypted
 
+
+def find_col(df: pd.DataFrame, keywords: list[str]) -> str | None:
+    """
+    컬럼명이 정확히 '상품명','수량'이 아닐 수도 있어서
+    포함 키워드 기반으로 탐색
+    """
+    cols = list(df.columns)
+    # 1) 정확히 일치 우선
+    for k in keywords:
+        if k in cols:
+            return k
+    # 2) 포함 탐색
+    for c in cols:
+        cs = str(c)
+        for k in keywords:
+            if k in cs:
+                return c
+    return None
+
+
+# =====================================================
+# PDF 생성 (예시 PDF 형태)
+# =====================================================
+def build_pdf(summary_df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+
+    # CID 폰트로 한글 깨짐 최소화
+    font_name = "Helvetica"
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+        font_name = "HYGothic-Medium"
+    except Exception:
+        pass
+
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "title",
+        parent=styles["Heading2"],
+        fontName=font_name,
+        fontSize=14,
+        leading=18,
+        spaceAfter=8,
+    )
+
+    elems = []
+    elems.append(Paragraph("▣ 제품별 개수", title_style))
+    elems.append(Spacer(1, 4))
+
+    data = [["제품명", "구분", "수량"]]
+    for _, r in summary_df.iterrows():
+        data.append([str(r["제품명"]), str(r["구분"]), str(r["수량"])])
+
+    table = LongTable(
+        data,
+        colWidths=[75 * mm, 60 * mm, 25 * mm],
+        repeatRows=1,
+    )
+    table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), font_name),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("ALIGN", (2, 1), (2, -1), "RIGHT"),
+                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                ("TOPPADDING", (0, 0), (-1, 0), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+                ("TOPPADDING", (0, 1), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+            ]
+        )
+    )
+    elems.append(table)
+    doc.build(elems)
+
+    return buf.getvalue()
+
+
+# =====================================================
+# Streamlit UI
+# =====================================================
+st.set_page_config(page_title="제품별 개수 생성기", page_icon="📄", layout="wide")
+st.title("📄 제품별 개수 생성기")
+st.caption('엑셀 업로드 → (상품명 매칭 규칙 적용) → 제품명/구분/수량 집계 → PDF 다운로드 (엑셀 비밀번호 "0000" 고정)')
+
+menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
 st.sidebar.markdown("---")
-st.sidebar.caption("저장 위치: data/name_mappings.json")
+st.sidebar.caption("규칙 파일: data/name_mappings.json")
 
 
-if menu == "📌 상품명 매칭 관리":
-    st.subheader("규칙을 직접 추가/수정해서 ‘표시될 상품명’을 통일합니다")
-
+# -----------------------------
+# 1) 매칭 규칙 관리 페이지
+# -----------------------------
+if menu == "🧩 상품명 매칭 규칙":
+    st.subheader("실제 상품명 → 표시될 상품명 규칙을 직접 만듭니다")
     st.markdown(
         """
-- **포함(contains)**: 상품명에 특정 단어가 들어가면 매칭 (옵션이 달라도 한 번에 처리하기 좋아요)
-- **정확히 일치(exact)**: 상품명이 완전히 같을 때만 매칭
-- **정규식(regex)**: 패턴이 복잡할 때 사용 (예: `와일드루꼴라\\s+(?:250g|500g|1kg)` )
+- **contains(포함)**: 가장 추천 (1kg/500g/250g 옵션이 달라도 같은 상품으로 묶기 쉬움)
+- **exact(정확히 일치)**: 상품명이 완전히 같은 경우만
+- **regex(정규식)**: 패턴이 복잡할 때
 """
     )
 
+    rules = load_rules()
     df = pd.DataFrame(rules)
-    # 컬럼 고정/정렬
     for col in ["enabled", "priority", "match_type", "pattern", "display_name", "note"]:
         if col not in df.columns:
             df[col] = None
@@ -156,27 +311,22 @@ if menu == "📌 상품명 매칭 관리":
         df,
         use_container_width=True,
         num_rows="dynamic",
+        hide_index=True,
         column_config={
             "enabled": st.column_config.CheckboxColumn("사용", default=True),
             "priority": st.column_config.NumberColumn("우선순위", help="작을수록 먼저 적용", min_value=0, step=1),
-            "match_type": st.column_config.SelectboxColumn(
-                "매칭 방식",
-                options=["contains", "exact", "regex"],
-                help="contains=포함, exact=정확히 일치, regex=정규식",
-            ),
+            "match_type": st.column_config.SelectboxColumn("매칭 방식", options=["contains", "exact", "regex"]),
             "pattern": st.column_config.TextColumn("실제 상품명(패턴)", width="large"),
             "display_name": st.column_config.TextColumn("표시될 상품명", width="medium"),
             "note": st.column_config.TextColumn("메모", width="large"),
         },
-        hide_index=True,
         key="mapping_editor",
     )
 
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
 
-    with col1:
+    with c1:
         if st.button("💾 저장", use_container_width=True):
-            # 빈 행/필수값 누락 제거 + 타입 정리
             cleaned = []
             for _, row in edited.iterrows():
                 pattern = normalize_text(row.get("pattern"))
@@ -184,20 +334,20 @@ if menu == "📌 상품명 매칭 관리":
                 if not pattern or not display:
                     continue
 
-                match_type = normalize_text(row.get("match_type")) or "contains"
-                if match_type not in {"contains", "exact", "regex"}:
-                    match_type = "contains"
+                mt = normalize_text(row.get("match_type")) or "contains"
+                if mt not in {"contains", "exact", "regex"}:
+                    mt = "contains"
 
                 try:
-                    priority = int(row.get("priority", 9999))
+                    pr = int(row.get("priority", 9999))
                 except Exception:
-                    priority = 9999
+                    pr = 9999
 
                 cleaned.append(
                     dict(
                         enabled=bool(row.get("enabled", True)),
-                        priority=priority,
-                        match_type=match_type,
+                        priority=pr,
+                        match_type=mt,
                         pattern=pattern,
                         display_name=display,
                         note=normalize_text(row.get("note")),
@@ -207,53 +357,143 @@ if menu == "📌 상품명 매칭 관리":
             save_rules(cleaned)
             st.success(f"저장 완료! (규칙 {len(cleaned)}개)")
 
-    with col2:
+    with c2:
         if st.button("♻️ 기본 예시로 초기화", use_container_width=True):
-            rules0 = default_rules()
-            save_rules(rules0)
-            st.success("기본 예시 규칙으로 초기화했어요. 새로고침(F5)하면 반영됩니다.")
+            save_rules(default_rules())
+            st.success("기본 예시 규칙으로 초기화했습니다. (새로고침 시 반영)")
 
-    with col3:
-        # 내보내기(다운로드)
+    with c3:
         export_bytes = json.dumps(load_rules(), ensure_ascii=False, indent=2).encode("utf-8")
         st.download_button(
-            "⬇️ 규칙 내보내기(JSON)",
+            "⬇️ 규칙 내보내기",
             data=export_bytes,
             file_name="name_mappings.json",
             mime="application/json",
             use_container_width=True,
         )
 
-    with col4:
-        # 가져오기(업로드)
+    with c4:
         up = st.file_uploader("규칙 가져오기(JSON)", type=["json"], label_visibility="collapsed")
         if up is not None:
             try:
                 imported = json.loads(up.getvalue().decode("utf-8"))
                 if not isinstance(imported, list):
-                    raise ValueError("리스트 형식(JSON 배열)이 아닙니다.")
+                    raise ValueError("JSON 배열(list) 형식이어야 합니다.")
                 save_rules(imported)
-                st.success("가져오기 완료! 새로고침(F5)하면 반영됩니다.")
+                st.success("가져오기 완료! (새로고침 시 반영)")
             except Exception as e:
                 st.error(f"가져오기 실패: {e}")
 
     st.markdown("---")
-    st.caption("팁) ‘와일드루꼴라’처럼 **핵심 단어만 ‘포함’ 규칙으로** 넣으면 1kg/500g/250g 옵션이 달라도 자동으로 같은 표시명으로 묶입니다.")
+    st.info(
+        '예) "채소팜 와일드루꼴라 1kg 베이비루꼴라" / "채소팜 와일드루꼴라 500g ..." 를 한 번에 묶으려면\n'
+        'pattern="와일드루꼴라", match_type="contains", display_name="와일드" 로 두면 됩니다.'
+    )
 
 
-elif menu == "🧪 매칭 테스트":
-    st.subheader("실제 상품명을 붙여 넣고 매칭 결과를 바로 확인하세요")
+# -----------------------------
+# 2) 엑셀 업로드 & 결과 페이지
+# -----------------------------
+else:
+    st.subheader("엑셀 업로드 → 제품명/구분/수량 집계")
 
-    sample = """채소팜 와일드루꼴라 1kg 베이비루꼴라
-채소팜 와일드루꼴라 500g 베이비루꼴라
-채소팜 와일드루꼴라 250g 베이비루꼴라
-채소팜 라디치오 1통 이탈리안치커리 (약350g)
-"""
-    text = st.text_area("실제 상품명 (줄바꿈으로 여러 개)", value=sample, height=180)
+    uploaded = st.file_uploader("비밀번호(0000) 엑셀 업로드 (.xlsx)", type=["xlsx"])
 
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    out = []
-    for a in lines:
-        out.append({"실제 상품명": a, "표시될 상품명": apply_mapping(a, load_rules())})
+    if uploaded is None:
+        st.info("엑셀을 업로드하면 결과 표와 PDF 다운로드가 나타납니다.")
+        st.stop()
 
-    st.dataframe(pd.DataFrame(out), use_container_width=True, height=520)
+    # 엑셀 복호화
+    try:
+        decrypted = decrypt_excel(uploaded.getvalue(), password=EXCEL_PASSWORD)
+    except Exception as e:
+        st.error('엑셀 복호화 실패: 비밀번호가 "0000"인지, 파일이 암호화된 xlsx인지 확인해 주세요.')
+        st.exception(e)
+        st.stop()
+
+    # 엑셀 읽기
+    try:
+        raw_df = pd.read_excel(decrypted, sheet_name=0, engine="openpyxl")
+    except Exception as e:
+        st.error("엑셀 읽기 실패: 시트 구조/형식이 예상과 다를 수 있어요.")
+        st.exception(e)
+        st.stop()
+
+    st.write("원본 일부 미리보기")
+    st.dataframe(raw_df.head(20), use_container_width=True)
+
+    # 컬럼 찾기
+    name_col = find_col(raw_df, ["상품명", "상품", "제품명"])
+    qty_col = find_col(raw_df, ["수량", "주문수량", "구매수량", "개수"])
+
+    if not name_col or not qty_col:
+        st.error("필수 컬럼을 찾지 못했습니다. (상품명/수량 계열 컬럼 필요)")
+        st.write("현재 컬럼:", list(raw_df.columns))
+        st.stop()
+
+    rules = load_rules()
+
+    work = raw_df[[name_col, qty_col]].copy()
+    work.rename(columns={name_col: "상품명", qty_col: "수량"}, inplace=True)
+
+    work["수량"] = pd.to_numeric(work["수량"], errors="coerce")
+    work["구분"] = work["상품명"].astype(str).apply(extract_variant)
+
+    mapped = work["상품명"].astype(str).apply(lambda x: apply_mapping(x, rules))
+    work["제품명"] = mapped.apply(lambda t: t[0])
+    work["매칭성공"] = mapped.apply(lambda t: t[1])
+
+    # 유효 행만
+    ok = work[(work["수량"].notna()) & (work["구분"] != "") & (work["제품명"] != "")].copy()
+
+    # 집계
+    summary = (
+        ok.groupby(["제품명", "구분"], as_index=False)["수량"]
+        .sum()
+        .sort_values(["제품명", "구분"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+    # 수량 예쁘게(정수면 정수로)
+    def fmt_qty(x):
+        try:
+            x = float(x)
+            return int(x) if x.is_integer() else x
+        except Exception:
+            return x
+
+    summary["수량"] = summary["수량"].apply(fmt_qty)
+
+    st.markdown("---")
+    st.subheader("✅ 결과 (제품명 / 구분 / 수량)")
+    st.dataframe(summary, use_container_width=True, height=560)
+
+    # 미매칭 목록
+    with st.expander("⚠️ 미매칭/누락 행 보기 (규칙 추가용)", expanded=False):
+        # 미매칭(표시명이 fallback이거나 매칭성공 False) + 구분/수량 누락도 같이 보여줌
+        bad = work[(work["매칭성공"] == False) | (work["구분"] == "") | (work["수량"].isna())].copy()
+        bad = bad.sort_values(["매칭성공", "구분"], ascending=[True, True])
+        st.write("아래를 보고 ‘상품명 매칭 규칙’에 pattern을 추가하면 결과가 예시 PDF처럼 깔끔해집니다.")
+        st.dataframe(bad.head(300), use_container_width=True)
+
+    # PDF 다운로드
+    pdf_bytes = build_pdf(summary)
+    filename = f"제품별개수_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.download_button(
+            "⬇️ PDF 다운로드",
+            data=pdf_bytes,
+            file_name=filename,
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            "⬇️ 결과 CSV 다운로드",
+            data=summary.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"제품별개수_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
