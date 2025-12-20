@@ -444,7 +444,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         "base",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=10,   # ✅ 고정
+        fontSize=12,   # ✅ 고정
         leading=12,
         spaceAfter=0,
     )
