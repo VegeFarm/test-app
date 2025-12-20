@@ -47,14 +47,16 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
+SUMRULES_PATH = DATA_DIR / "sum_rules.json"
+
 BACKUP_DIR = DATA_DIR / "rules_backup"
 BACKUP_DIR.mkdir(exist_ok=True)
 
-# 수취인별 PDF 스타일(원하면 여기만 수정)
+# 수취인별 PDF 스타일
 RECIPIENT_FONT_SIZE = 12
 RECIPIENT_LEADING = 15
-RECIPIENT_BLOCK_GAP_MM = 4.0   # 한 사람 블록 아래 여백(Spacer)
-RECIPIENT_LINE_AFTER_MM = 4.0  # 구분선 아래 여백(spaceAfter)
+RECIPIENT_BLOCK_GAP_MM = 4.0
+RECIPIENT_LINE_AFTER_MM = 4.0
 
 # 스티커 용지 설정 (A4 / 65칸 / 38.2x21.1mm)
 STICKER_COLS = 5
@@ -66,7 +68,6 @@ STICKER_CELL_H_MM = 21.1
 # ✅ 스티커 텍스트 스타일 (Bold 없음 / 11pt)
 STICKER_FONT_SIZE = 11
 STICKER_LEADING = 13
-STICKER_BOLD = False  # (사용 안 함, 유지용)
 
 
 # =====================================================
@@ -95,60 +96,8 @@ def extract_variant(name: str) -> str:
 
 
 # =====================================================
-# RULES (상품명 매칭 + 합산규칙)
+# Helpers
 # =====================================================
-def default_rules() -> List[Dict]:
-    # ✅ 우선순위 없음: 규칙은 "위에서 아래 순서대로" 적용됩니다.
-    return [
-        {
-            "enabled": True,
-            "match_type": "contains",
-            "pattern": "와일드루꼴라",
-            "display_name": "와일드",
-            "sum_rule": None,
-            "note": '예) "채소팜 와일드루꼴라 1kg ..." -> 와일드',
-        },
-        {
-            "enabled": True,
-            "match_type": "contains",
-            "pattern": "라디치오",
-            "display_name": "라디치오",
-            "sum_rule": None,
-            "note": '예) "채소팜 라디치오 1통 ..." -> 라디치오',
-        },
-        {
-            "enabled": False,
-            "match_type": "contains",
-            "pattern": "오렌지",
-            "display_name": "오렌지",
-            "sum_rule": 5,
-            "note": "합산규칙=5 예시 (개/봉/통/팩)",
-        },
-    ]
-
-
-def load_rules() -> List[Dict]:
-    if not MAPPING_PATH.exists():
-        rules = default_rules()
-        save_rules(rules)
-        return rules
-
-    try:
-        raw = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return raw
-    except Exception:
-        pass
-
-    rules = default_rules()
-    save_rules(rules)
-    return rules
-
-
-def save_rules(rules: List[Dict]) -> None:
-    MAPPING_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def normalize_text(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
@@ -164,14 +113,70 @@ def _safe_int(v) -> Optional[int]:
         return None
 
 
-def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optional[int]]:
+# =====================================================
+# RULES: 1) 상품명 매칭규칙
+# =====================================================
+def default_mapping_rules() -> List[Dict]:
+    # ✅ 규칙은 "위에서 아래 순서대로" 매칭되며, 첫 매칭 1개만 적용
+    return [
+        {
+            "enabled": True,
+            "match_type": "contains",
+            "pattern": "와일드루꼴라",
+            "display_name": "와일드",
+            "note": '예) "채소팜 와일드루꼴라 1kg ..." -> 와일드',
+        },
+        {
+            "enabled": True,
+            "match_type": "contains",
+            "pattern": "라디치오",
+            "display_name": "라디치오",
+            "note": '예) "채소팜 라디치오 1통 ..." -> 라디치오',
+        },
+    ]
+
+
+def load_mapping_rules() -> List[Dict]:
+    if not MAPPING_PATH.exists():
+        rules = default_mapping_rules()
+        save_mapping_rules(rules)
+        return rules
+
+    try:
+        raw = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            cleaned = []
+            for r in raw:
+                # 과거 버전 sum_rule/priority 같은 필드가 있어도 무시
+                cleaned.append(
+                    dict(
+                        enabled=bool(r.get("enabled", True)),
+                        match_type=normalize_text(r.get("match_type", "contains")) or "contains",
+                        pattern=normalize_text(r.get("pattern", "")),
+                        display_name=normalize_text(r.get("display_name", "")),
+                        note=normalize_text(r.get("note", "")),
+                    )
+                )
+            return cleaned
+    except Exception:
+        pass
+
+    rules = default_mapping_rules()
+    save_mapping_rules(rules)
+    return rules
+
+
+def save_mapping_rules(rules: List[Dict]) -> None:
+    MAPPING_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool]:
     """
-    ✅ 우선순위 없음: rules 리스트의 "순서대로" 매칭 → 첫 매칭 1개만 적용
-    return: (제품명, 매칭성공여부, 합산규칙N or None)
+    return: (제품명, 매칭성공여부)
     """
     actual = normalize_text(actual_name)
     if not actual:
-        return "", False, None
+        return "", False
 
     for r in rules:
         if not r.get("enabled", True):
@@ -180,7 +185,6 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
         mt = normalize_text(r.get("match_type", "contains")) or "contains"
         pattern = normalize_text(r.get("pattern", ""))
         display = normalize_text(r.get("display_name", ""))
-        sum_rule = _safe_int(r.get("sum_rule"))
 
         if not pattern or not display:
             continue
@@ -197,9 +201,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
                 matched = False
 
         if matched:
-            if sum_rule is not None and sum_rule < 2:
-                sum_rule = None
-            return display, True, sum_rule
+            return display, True
 
     # --- fallback ---
     s = re.sub(r"^\s*채소팜\s*", "", actual)
@@ -211,7 +213,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
 
     toks = s.split()
     if not toks:
-        return actual, False, None
+        return actual, False
 
     PREFIX = {"생", "유기농", "국산", "수입", "냉동", "베이비", "프리미엄"}
     if len(toks) >= 2 and toks[0] in PREFIX:
@@ -219,21 +221,19 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
     else:
         fallback = toks[0]
 
-    return fallback, False, None
+    return fallback, False
 
 
-def rules_df_from_list(rules: List[Dict]) -> pd.DataFrame:
+def mapping_df_from_list(rules: List[Dict]) -> pd.DataFrame:
     df = pd.DataFrame(rules)
-    # 우선순위 제거(있어도 무시)
-    keep_cols = ["enabled", "match_type", "pattern", "display_name", "sum_rule", "note"]
-    for c in keep_cols:
+    keep = ["enabled", "match_type", "pattern", "display_name", "note"]
+    for c in keep:
         if c not in df.columns:
             df[c] = None
-    df = df[keep_cols]
-    return df
+    return df[keep]
 
 
-def rules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
+def mapping_list_from_df(edited: pd.DataFrame) -> List[Dict]:
     cleaned = []
     for _, row in edited.iterrows():
         pattern = normalize_text(row.get("pattern"))
@@ -245,16 +245,158 @@ def rules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
         if mt not in {"contains", "exact", "regex"}:
             mt = "contains"
 
-        sr = _safe_int(row.get("sum_rule"))
-        if sr is not None and sr < 2:
-            sr = None
-
         cleaned.append(
             dict(
                 enabled=bool(row.get("enabled", True)),
                 match_type=mt,
                 pattern=pattern,
                 display_name=display,
+                note=normalize_text(row.get("note")),
+            )
+        )
+    return cleaned
+
+
+# =====================================================
+# RULES: 2) 합산규칙(별도 관리)
+# =====================================================
+def default_sum_rules() -> List[Dict]:
+    # 제품명(표시될 상품명)에 대해 합산규칙 N을 매칭
+    # (실제 분해/합산은 개/봉/통/팩 단위에만 적용됨)
+    return [
+        {
+            "enabled": False,
+            "match_type": "exact",
+            "pattern": "오렌지",
+            "sum_rule": 5,
+            "note": "예: 오렌지 합산규칙 5",
+        }
+    ]
+
+
+def load_sum_rules(mapping_rules: Optional[List[Dict]] = None) -> List[Dict]:
+    # sum_rules.json이 없으면: 기존 name_mappings.json에 sum_rule이 들어있던 옛 버전을 자동 흡수(가능하면)
+    if SUMRULES_PATH.exists():
+        try:
+            raw = json.loads(SUMRULES_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                out = []
+                for r in raw:
+                    sr = _safe_int(r.get("sum_rule"))
+                    if sr is not None and sr < 2:
+                        sr = None
+                    out.append(
+                        dict(
+                            enabled=bool(r.get("enabled", True)),
+                            match_type=normalize_text(r.get("match_type", "exact")) or "exact",
+                            pattern=normalize_text(r.get("pattern", "")),
+                            sum_rule=sr,
+                            note=normalize_text(r.get("note", "")),
+                        )
+                    )
+                return out
+        except Exception:
+            pass
+
+    # ---- legacy absorb ----
+    legacy = []
+    try:
+        if MAPPING_PATH.exists():
+            raw = json.loads(MAPPING_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                for r in raw:
+                    sr = _safe_int(r.get("sum_rule"))
+                    dn = normalize_text(r.get("display_name", ""))
+                    if sr and sr >= 2 and dn:
+                        legacy.append(
+                            dict(
+                                enabled=bool(r.get("enabled", True)),
+                                match_type="exact",
+                                pattern=dn,
+                                sum_rule=sr,
+                                note="(구버전에서 자동 이관)",
+                            )
+                        )
+    except Exception:
+        legacy = []
+
+    if legacy:
+        save_sum_rules(legacy)
+        return legacy
+
+    rules = default_sum_rules()
+    save_sum_rules(rules)
+    return rules
+
+
+def save_sum_rules(rules: List[Dict]) -> None:
+    SUMRULES_PATH.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def apply_sum_rule(product_name: str, sum_rules: List[Dict]) -> Optional[int]:
+    """
+    제품명(표시될 상품명)을 기준으로 합산규칙 N 반환 (첫 매칭 1개)
+    """
+    p = normalize_text(product_name)
+    if not p:
+        return None
+
+    for r in sum_rules:
+        if not r.get("enabled", True):
+            continue
+
+        mt = normalize_text(r.get("match_type", "exact")) or "exact"
+        pattern = normalize_text(r.get("pattern", ""))
+        sr = _safe_int(r.get("sum_rule", None))
+
+        if not pattern or sr is None or sr < 2:
+            continue
+
+        matched = False
+        if mt == "exact":
+            matched = (p == pattern)
+        elif mt == "contains":
+            matched = (pattern in p)
+        elif mt == "regex":
+            try:
+                matched = bool(re.search(pattern, p))
+            except re.error:
+                matched = False
+
+        if matched:
+            return sr
+
+    return None
+
+
+def sumrules_df_from_list(rules: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rules)
+    keep = ["enabled", "match_type", "pattern", "sum_rule", "note"]
+    for c in keep:
+        if c not in df.columns:
+            df[c] = None
+    return df[keep]
+
+
+def sumrules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
+    cleaned = []
+    for _, row in edited.iterrows():
+        pattern = normalize_text(row.get("pattern"))
+        sr = _safe_int(row.get("sum_rule"))
+
+        if not pattern or sr is None or sr < 2:
+            # pattern 또는 sum_rule이 없으면 스킵 (삭제 효과)
+            continue
+
+        mt = normalize_text(row.get("match_type")) or "exact"
+        if mt not in {"contains", "exact", "regex"}:
+            mt = "exact"
+
+        cleaned.append(
+            dict(
+                enabled=bool(row.get("enabled", True)),
+                match_type=mt,
+                pattern=pattern,
                 sum_rule=sr,
                 note=normalize_text(row.get("note")),
             )
@@ -262,23 +404,36 @@ def rules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
     return cleaned
 
 
-def backup_rules_to_excel(rules_list: List[Dict]) -> Path:
+# =====================================================
+# Backups (Excel)
+# =====================================================
+def backup_rules_to_excel(mapping_rules: List[Dict], sum_rules: List[Dict]) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = BACKUP_DIR / f"rules_backup_{ts}.xlsx"
 
-    df = rules_df_from_list(rules_list).copy()
-    # 보기 좋게 한글 헤더
-    df = df.rename(
+    df_map = mapping_df_from_list(mapping_rules).rename(
         columns={
             "enabled": "사용",
             "match_type": "매칭방식",
             "pattern": "실제상품명(패턴)",
             "display_name": "표시될상품명",
+            "note": "메모",
+        }
+    )
+    df_sum = sumrules_df_from_list(sum_rules).rename(
+        columns={
+            "enabled": "사용",
+            "match_type": "매칭방식",
+            "pattern": "제품명(패턴)",
             "sum_rule": "합산규칙(N)",
             "note": "메모",
         }
     )
-    df.to_excel(out_path, index=False)
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df_map.to_excel(writer, sheet_name="상품명매칭", index=False)
+        df_sum.to_excel(writer, sheet_name="합산규칙", index=False)
+
     return out_path
 
 
@@ -327,6 +482,10 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
 
 
 def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_rows columns: 제품명, 구분, 수량, 합산규칙
+    합산규칙은 개/봉/통/팩 단위에서만 분해됩니다.
+    """
     out = []
     for _, r in df_rows.iterrows():
         product = r["제품명"]
@@ -623,14 +782,7 @@ def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) ->
     return [line1, (trimmed + "...") if trimmed else "..."]
 
 
-def _draw_center_text(
-    c: canvas.Canvas,
-    font_name: str,
-    font_size: int,
-    x_center: float,
-    y: float,
-    txt: str,
-):
+def _draw_center_text(c: canvas.Canvas, font_name: str, font_size: int, x_center: float, y: float, txt: str):
     txt = (txt or "").strip()
     if not txt:
         return
@@ -721,54 +873,102 @@ st.title("📄 제품별 개수 & 수취인별 출력")
 st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(새벽/익일) PDF + 스티커용지 PDF (엑셀 비밀번호 "0000" 고정)')
 
 menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
-
 st.sidebar.markdown("---")
-st.sidebar.caption("규칙 파일: data/name_mappings.json")
 
-# ✅ 사이드바: 규칙 백업 폴더(리스트)
-st.sidebar.markdown("### 📁 규칙 백업폴더")
-try:
-    backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-except Exception:
-    backups = []
 
-if not backups:
-    st.sidebar.caption("아직 백업 파일이 없습니다.")
-else:
-    for i, fp in enumerate(backups[:30]):  # 너무 많아지면 상위 30개만
+# -----------------------------
+# Sidebar: (상품명 매칭 규칙 메뉴에서만) 백업폴더 + 합산규칙 관리
+# -----------------------------
+def sidebar_backup_and_sumrules(mapping_rules: List[Dict], sum_rules: List[Dict]):
+    # 1) 백업폴더 (펼쳐보기 + 다운로드 + 삭제)
+    with st.sidebar.expander("📁 규칙 백업폴더", expanded=False):
         try:
-            b = fp.read_bytes()
-            st.sidebar.download_button(
-                label=f"⬇️ {fp.name}",
-                data=b,
-                file_name=fp.name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_backup_{i}_{fp.name}",
-            )
+            backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
         except Exception:
-            st.sidebar.caption(f"(읽기 실패) {fp.name}")
+            backups = []
+
+        if not backups:
+            st.caption("아직 백업 파일이 없습니다.")
+        else:
+            for i, fp in enumerate(backups[:50]):
+                cols = st.columns([6, 2, 2])
+                cols[0].write(fp.name)
+
+                # 다운로드
+                try:
+                    b = fp.read_bytes()
+                    cols[1].download_button(
+                        "다운",
+                        data=b,
+                        file_name=fp.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_bk_{i}_{fp.name}",
+                        use_container_width=True,
+                    )
+                except Exception:
+                    cols[1].write("")
+
+                # 삭제
+                if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
+                    try:
+                        fp.unlink()
+                        st.success(f"삭제 완료: {fp.name}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("삭제 실패")
+                        st.exception(e)
+
+    # 2) 합산규칙 편집 (펼쳐보기 + 수정/추가/삭제 + 저장)
+    with st.sidebar.expander("➕ 합산규칙 관리", expanded=False):
+        st.caption("※ 합산규칙은 개/봉/통/팩 단위에서만 분해/합산됩니다.")
+        df = sumrules_df_from_list(sum_rules)
+
+        edited = st.data_editor(
+            df,
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "enabled": st.column_config.CheckboxColumn("사용", default=True),
+                "match_type": st.column_config.SelectboxColumn("매칭", options=["exact", "contains", "regex"]),
+                "pattern": st.column_config.TextColumn("제품명(패턴)"),
+                "sum_rule": st.column_config.NumberColumn("N", min_value=2, step=1),
+                "note": st.column_config.TextColumn("메모"),
+            },
+            key="sumrules_editor_sidebar",
+        )
+
+        if st.button("💾 합산규칙 저장", use_container_width=True, key="save_sumrules_btn"):
+            cleaned = sumrules_list_from_df(edited)
+            save_sum_rules(cleaned)
+            st.success(f"합산규칙 저장 완료 ({len(cleaned)}개)")
+            st.rerun()
+
+        # 편의: 현재 적용 예시 한 줄
+        st.caption("예: 제품명=오렌지, N=5 → 8개 주문 시 5개 1개 + 3개 1개")
 
 
 # -----------------------------
 # 1) 규칙 관리
 # -----------------------------
 if menu == "🧩 상품명 매칭 규칙":
-    st.subheader("실제 상품명 → 표시될 상품명 + 합산규칙(개/봉/통/팩)")
+    mapping_rules = load_mapping_rules()
+    sum_rules = load_sum_rules(mapping_rules)
+
+    sidebar_backup_and_sumrules(mapping_rules, sum_rules)
+
+    st.subheader("실제 상품명 → 표시될 상품명")
 
     st.markdown(
         """
 **매칭방식 설명**
-- **contains**: `패턴`이 `엑셀 상품명` 안에 **포함**되어 있으면 매칭 (가장 많이 쓰는 방식)
+- **contains**: `패턴`이 `엑셀 상품명` 안에 **포함**되어 있으면 매칭
 - **exact**: `패턴`과 `엑셀 상품명`이 **완전히 동일**할 때만 매칭
 - **regex**: `패턴`을 **정규식**으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
-
-✅ **우선순위는 제거했습니다.**  
-➡️ 규칙은 **표에 보이는 위→아래 순서대로** 적용되며, **처음 매칭되는 1개**만 적용됩니다.
 """
     )
 
-    rules = load_rules()
-    df = rules_df_from_list(rules)
+    df = mapping_df_from_list(mapping_rules)
 
     edited = st.data_editor(
         df,
@@ -780,32 +980,27 @@ if menu == "🧩 상품명 매칭 규칙":
             "match_type": st.column_config.SelectboxColumn("매칭 방식", options=["contains", "exact", "regex"]),
             "pattern": st.column_config.TextColumn("실제 상품명(패턴)", width="large"),
             "display_name": st.column_config.TextColumn("표시될 상품명", width="medium"),
-            "sum_rule": st.column_config.NumberColumn(
-                "합산규칙(N)",
-                help="개/봉/통/팩 상품을 N묶음으로 표현 (비우면 미적용)",
-                min_value=2,
-                step=1,
-            ),
             "note": st.column_config.TextColumn("메모", width="large"),
         },
-        key="mapping_editor",
+        key="mapping_editor_main",
     )
 
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("💾 저장", use_container_width=True):
-            cleaned = rules_list_from_df(edited)
-            save_rules(cleaned)
+            cleaned = mapping_list_from_df(edited)
+            save_mapping_rules(cleaned)
             st.success(f"저장 완료! (규칙 {len(cleaned)}개)")
+            st.rerun()
 
     with c2:
         if st.button("📗 엑셀로 저장하기(백업)", use_container_width=True):
-            # 현재 편집 상태 그대로 백업 저장(저장 버튼을 안 눌러도 백업 가능)
-            cleaned = rules_list_from_df(edited)
-            outp = backup_rules_to_excel(cleaned)
-            st.success(f"백업 저장 완료: {outp.as_posix()}")
-
-    st.info("합산규칙은 개/봉/통/팩 단위에만 적용됩니다. (kg/g 등은 미적용)")
+            cleaned_map = mapping_list_from_df(edited)
+            # sumrules는 사이드바 에디터가 따로 있으니 현재 파일 기준 로드해서 같이 백업
+            cleaned_sum = load_sum_rules()
+            outp = backup_rules_to_excel(cleaned_map, cleaned_sum)
+            st.success(f"백업 저장 완료: {outp.name}")
+            st.rerun()
 
 
 # -----------------------------
@@ -852,7 +1047,8 @@ else:
         st.write("현재 컬럼:", list(raw_df.columns))
         st.stop()
 
-    rules = load_rules()
+    mapping_rules = load_mapping_rules()
+    sum_rules = load_sum_rules(mapping_rules)
 
     work = raw_df[[col_buyer, col_recv, col_addr, col_opt, col_name, col_qty]].copy()
     work.columns = ["구매자명", "수취인명", "통합배송지", "옵션정보", "상품명", "수량"]
@@ -861,10 +1057,12 @@ else:
     work["수량"] = pd.to_numeric(work["수량"], errors="coerce")
     work["구분"] = work["상품명"].apply(extract_variant)
 
-    mapped = work["상품명"].apply(lambda x: apply_mapping(x, rules))
+    mapped = work["상품명"].apply(lambda x: apply_mapping(x, mapping_rules))
     work["제품명"] = mapped.apply(lambda t: t[0])
     work["매칭성공"] = mapped.apply(lambda t: t[1])
-    work["합산규칙"] = mapped.apply(lambda t: t[2])
+
+    # ✅ 합산규칙은 "제품명" 기준으로 별도 적용
+    work["합산규칙"] = work["제품명"].apply(lambda p: apply_sum_rule(p, sum_rules))
 
     base = work[(work["수량"].notna()) & (work["제품명"] != "")].copy()
 
@@ -891,7 +1089,7 @@ else:
     )
 
     # -----------------------------
-    # 스티커 PDF (Bold 없음 / 11pt)
+    # 스티커 PDF
     # -----------------------------
     st.markdown("---")
     st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
@@ -912,10 +1110,7 @@ else:
         sticker_texts.extend([label] * qty)
 
     pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
-    st.caption(
-        f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 "
-        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold 없음)"
-    )
+    st.caption(f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 (페이지당 65칸 / 글자 {STICKER_FONT_SIZE}pt)")
 
     sticker_pdf = build_sticker_pdf(sticker_texts)
     st.download_button(
@@ -930,7 +1125,7 @@ else:
     # 수취인별 출력
     # -----------------------------
     st.markdown("---")
-    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (수취인명 길이에 맞춰 옆에 붙이기)")
+    st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리")
 
     base2 = base.copy()
     base2["배송구분"] = base2["옵션정보"].apply(classify_delivery)
