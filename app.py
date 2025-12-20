@@ -2,7 +2,7 @@ import io
 import json
 import re
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict
 from collections import OrderedDict
@@ -79,10 +79,10 @@ STICKER_FONT_SIZE = 11
 STICKER_LEADING = 13
 
 # ✅ TC 양식 기본값
-TC_DEFAULT_PLACE = "문앞"  # "배송 받을 장소*" 기본값(필수 칼럼이라 기본값을 넣어둠)
 TC_PRODUCT_NAME_FIXED = "채소팜상품"
 TC_TYPE_DAWN = "자동"
 TC_TYPE_NEXT = "택배대행"
+TC_ACCESS_FALLBACK = "경비실 호출"
 
 
 # =====================================================
@@ -163,6 +163,11 @@ def _as_int_qty(v) -> int:
         return int(round(f))
     except Exception:
         return 0
+
+
+def _clean_access_message(msg: str) -> str:
+    s = str(msg or "").strip()
+    return s if s else TC_ACCESS_FALLBACK
 
 
 # =====================================================
@@ -842,6 +847,9 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
 
 # =====================================================
 # TC 주문_등록양식 자동 채우기
+#  - 정렬: 수취인별 출력 순서와 동일 (원본 등장 순)
+#  - 배송받을장소: 기입하지 않음(아예 건드리지 않음)
+#  - 출입방법: 공백이면 "경비실 호출"
 # =====================================================
 def _norm_header(s: str) -> str:
     s = str(s or "")
@@ -883,11 +891,6 @@ def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> b
     c_in = col_of(["출입방법", "출입 방법"])
     c_prod = col_of(["상품명", "상품명*"])
     c_type = col_of(["배송유형", "배송 유형", "배송 유형*"])
-    # 필수일 가능성이 높아 기본값 채움
-    try:
-        c_place = col_of(["배송받을장소", "배송 받을 장소", "배송 받을 장소*"])
-    except KeyError:
-        c_place = None
 
     start_row = 2
     for i, r in enumerate(rows):
@@ -900,8 +903,8 @@ def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> b
         ws.cell(rr, c_in).value = r.get("출입방법", "")
         ws.cell(rr, c_prod).value = r.get("상품명", "")
         ws.cell(rr, c_type).value = r.get("배송유형", "")
-        if c_place is not None:
-            ws.cell(rr, c_place).value = r.get("배송받을장소", TC_DEFAULT_PLACE)
+
+        # ✅ 배송받을장소는 "기입하지 말아줘" -> 템플릿 값 유지 (아예 건드리지 않음)
 
     out = io.BytesIO()
     wb.save(out)
@@ -1201,7 +1204,7 @@ else:
         if qty > 0:
             label_rows.append((label, qty))
 
-    label_rows.sort(key=lambda x: x[0])  # 가나다(유니코드) 순
+    label_rows.sort(key=lambda x: x[0])  # 스티커는 가나다 순 유지
 
     sticker_texts: List[str] = []
     for label, qty in label_rows:
@@ -1239,15 +1242,6 @@ else:
     )
     base2 = base2.merge(grp_deliv, on=key_cols, how="left")
 
-    def _first_nonempty(series: pd.Series) -> str:
-        for v in series.tolist():
-            if v is None:
-                continue
-            s = str(v).strip()
-            if s and s.lower() != "nan":
-                return s
-        return ""
-
     def build_items_for_group(g: pd.DataFrame) -> Tuple[str, str]:
         g = g.sort_index()
 
@@ -1272,7 +1266,11 @@ else:
         rows = [{"제품명": p, "구분": v, "수량": q, "합산규칙": sr} for (p, v, sr), q in od.items()]
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
         rows_ex = (
-            explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]], bundle_units=bundle_units, default_unit=default_unit)
+            explode_sum_rule_rows(
+                rows_df[["제품명", "구분", "수량", "합산규칙"]],
+                bundle_units=bundle_units,
+                default_unit=default_unit,
+            )
             if len(rows_df)
             else rows_df
         )
@@ -1330,11 +1328,11 @@ else:
 
     # -----------------------------
     # ✅ TC주문_등록양식 자동작성 (새벽/익일 각각)
+    #    - 정렬: 수취인별 출력 순서와 동일 (원본 등장 순)
     # -----------------------------
     st.markdown("---")
     st.subheader("🧾 TC주문_등록양식 자동작성 (새벽배송 / 익일배송 각각 엑셀 생성)")
 
-    # 템플릿 파일: 기본(레포에 포함) 또는 업로드
     tc_up = st.file_uploader("TC주문_등록양식.xlsx (선택) - 레포에 파일이 있으면 업로드 안 해도 됩니다", type=["xlsx"])
     template_bytes = None
     if tc_up is not None:
@@ -1345,25 +1343,37 @@ else:
     if template_bytes is None:
         st.warning("TC주문_등록양식.xlsx 템플릿을 업로드하거나, 앱 폴더에 'TC주문_등록양식.xlsx' 파일을 넣어주세요.")
     else:
-        # 그룹별로 1행 생성 (구매자/수취인/주소 기준)
-        # 필요 필드: 구매자명, 수취인명, 통합배송지, 수취인연락처, 배송메세지, 그룹배송구분
-        grp_info = (
+        # ✅ 수취인별 출력과 동일한 그룹 순서 확보 (등장 순)
+        order_keys_df = base2[key_cols].drop_duplicates(keep="first").copy()
+
+        def _first_nonempty(series: pd.Series) -> str:
+            for v in series.tolist():
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    return s
+            return ""
+
+        grp_info_agg = (
             base2.groupby(key_cols, as_index=False)
             .agg(
                 그룹배송구분=("그룹배송구분", "first"),
                 수취인연락처=("수취인연락처", _first_nonempty),
                 배송메세지=("배송메세지", _first_nonempty),
+                구매자명=("구매자명", "first"),
+                수취인명=("수취인명", "first"),
+                통합배송지=("통합배송지", "first"),
             )
         )
+        # order_keys_df에 agg 결과를 붙여서 "순서"를 강제
+        grp_info = order_keys_df.merge(grp_info_agg, on=key_cols, how="left")
 
         def make_tc_rows(df: pd.DataFrame, ship: str) -> List[Dict[str, str]]:
             out = []
-            for _, r in df.iterrows():
-                if ship == "새벽배송":
-                    ship_type = TC_TYPE_DAWN
-                else:
-                    ship_type = TC_TYPE_NEXT
+            ship_type = TC_TYPE_DAWN if ship == "새벽배송" else TC_TYPE_NEXT
 
+            for _, r in df.iterrows():
                 out.append(
                     {
                         "배송요청일": req_day_str,
@@ -1371,10 +1381,10 @@ else:
                         "수령자": str(r["수취인명"] or "").strip(),
                         "수령자도로명주소": str(r["통합배송지"] or "").strip(),
                         "수령자연락처": str(r.get("수취인연락처", "") or "").strip(),
-                        "출입방법": str(r.get("배송메세지", "") or "").strip(),
+                        # ✅ 공백이면 "경비실 호출"
+                        "출입방법": _clean_access_message(r.get("배송메세지", "")),
                         "상품명": TC_PRODUCT_NAME_FIXED,
                         "배송유형": ship_type,
-                        "배송받을장소": TC_DEFAULT_PLACE,
                     }
                 )
             return out
