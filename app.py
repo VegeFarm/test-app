@@ -480,13 +480,13 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         block = KeepTogether(
             [
                 p,
-                Spacer(1, 2.0 * mm),
+                Spacer(1, 4.0 * mm),
                 HRFlowable(
                     width="100%",
                     thickness=0.4,
                     color=colors.lightgrey,
                     spaceBefore=0,
-                    spaceAfter=2.0 * mm,
+                    spaceAfter=4.0 * mm,
                 ),
             ]
         )
