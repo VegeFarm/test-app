@@ -61,13 +61,13 @@ STICKER_CELL_W_MM = 38.2
 STICKER_CELL_H_MM = 21.1
 
 # ✅ 스티커 텍스트 스타일
-STICKER_FONT_SIZE = 12     # 글자 크기(포인트)
+STICKER_FONT_SIZE = 11     # 글자 크기(포인트)
 STICKER_LEADING = 11
 STICKER_BOLD = True
 
 # ✅ 깔끔한 Bold: fill + stroke 방식
 STICKER_BOLD_MODE = "stroke"
-STICKER_STROKE_WIDTH = 0.12  # 0.18~0.30 조절
+STICKER_STROKE_WIDTH = 0.10  # 0.18~0.30 조절
 
 
 # =====================================================
