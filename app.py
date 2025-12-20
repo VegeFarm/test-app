@@ -366,7 +366,6 @@ def fmt_qty(x):
 def _as_int_qty(v) -> int:
     try:
         f = float(v)
-        # 거의 정수면 정수로
         if abs(f - round(f)) < 1e-9:
             return int(round(f))
         return int(round(f))
@@ -443,7 +442,6 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 # =====================================================
 # PDF 2) 수취인별 출력 (행별로 수취인명 길이에 맞춰 붙이기)
-#   ✅ 둘째 줄부터는 "주문상품 시작 위치" 밑으로 이어짐 (hanging indent)
 # =====================================================
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     buf = io.BytesIO()
@@ -486,11 +484,9 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         recv = (e.get("수취인명") or "").strip() or " "
         items = (e.get("items_line") or "").strip() or " "
 
-        # 이 행의 "수취인명 - " 너비만큼 들여쓰기(둘째 줄부터)
         name_token_plain = f"{recv} - "
         indent = _text_width_pt(name_token_plain, font_name, base_style.fontSize)
 
-        # 너무 긴 이름이면 상한(주문상품 공간 확보)
         indent_cap = usable_width * 0.55
         indent = min(max(indent, 40), indent_cap)
 
@@ -498,7 +494,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
             f"line_{abs(hash(recv)) % 10_000_000}",
             parent=base_style,
             leftIndent=indent,
-            firstLineIndent=-indent,  # 첫 줄은 0에서 시작, 다음 줄부터 indent 위치
+            firstLineIndent=-indent,
         )
 
         text = f"<b>{_xml_escape(recv)}</b> - {_xml_escape(items)}"
@@ -525,6 +521,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 # =====================================================
 # PDF 3) 스티커 용지 (A4 / 65칸 / 38.2x21.1mm)
+#   ✅ 60칸만 나오는 현상 방지: SAFETY_MM로 여백을 살짝 줄여 프레임을 크게 확보
 # =====================================================
 def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     """
@@ -543,13 +540,15 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     page_w_mm = 210.0
     page_h_mm = 297.0
 
-    grid_w_mm = STICKER_COLS * STICKER_CELL_W_MM
-    grid_h_mm = STICKER_ROWS * STICKER_CELL_H_MM
+    grid_w_mm = STICKER_COLS * STICKER_CELL_W_MM   # 191.0
+    grid_h_mm = STICKER_ROWS * STICKER_CELL_H_MM   # 274.3
 
-    # 가운데 정렬되도록 여백 자동 계산
-    left_margin_mm = max((page_w_mm - grid_w_mm) / 2.0, 0)
+    # ✅ 핵심: pt 변환 반올림 오차로 마지막 1행이 밀리는 것을 방지하는 안전 여유(mm)
+    SAFETY_MM = 1.0
+
+    left_margin_mm = max((page_w_mm - grid_w_mm) / 2.0 - SAFETY_MM, 0)
     right_margin_mm = left_margin_mm
-    top_margin_mm = max((page_h_mm - grid_h_mm) / 2.0, 0)
+    top_margin_mm = max((page_h_mm - grid_h_mm) / 2.0 - SAFETY_MM, 0)
     bottom_margin_mm = top_margin_mm
 
     doc = SimpleDocTemplate(
@@ -572,7 +571,6 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
         spaceAfter=0,
     )
 
-    # 페이지 단위로 쪼개기
     def chunks(lst, n):
         for i in range(0, len(lst), n):
             yield lst[i:i + n]
@@ -586,7 +584,6 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     row_heights = [STICKER_CELL_H_MM * mm] * STICKER_ROWS
 
     for pi, page_labels in enumerate(pages):
-        # 13x5 채우기 (행 우선: 왼→오, 위→아래)
         data = []
         idx = 0
         for _r in range(STICKER_ROWS):
@@ -830,6 +827,7 @@ else:
         if var in ("", "-", "nan", "None"):
             label = name
         else:
+            # 예시처럼 "가지1개"가 목표면 아래를 label=f"{name}{var}" 로 바꾸면 됨
             label = f"{name} {var}".strip()
         qty = _as_int_qty(r["수량"])
         if qty > 0:
@@ -886,7 +884,7 @@ else:
             if not prod:
                 continue
             if var == "":
-                var = "-"  # 슬래시 출력 대비
+                var = "-"
 
             key = (prod, var, sr)
             if key not in od:
