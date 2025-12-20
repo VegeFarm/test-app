@@ -61,22 +61,22 @@ STICKER_CELL_W_MM = 38.2
 STICKER_CELL_H_MM = 21.1
 
 # ✅ 스티커 텍스트 스타일
-STICKER_FONT_SIZE = 9     # 현재 글자 크기(포인트)
+STICKER_FONT_SIZE = 9     # 글자 크기(포인트)
 STICKER_LEADING = 11
 STICKER_BOLD = True
 
-# ✅ 깔끔한 Bold: fill + stroke 방식(겹쳐그리기 제거)
-STICKER_BOLD_MODE = "stroke"    # "stroke" 권장
-STICKER_STROKE_WIDTH = 0.12     # 0.18~0.30 사이에서 조절 (지저분하면 더 낮추기)
+# ✅ 깔끔한 Bold: fill + stroke 방식
+STICKER_BOLD_MODE = "stroke"
+STICKER_STROKE_WIDTH = 0.22  # 0.18~0.30 조절
 
 
 # =====================================================
 # VARIANT(단위) 추출
 # =====================================================
 UNIT_PATTERNS = [
-    r"\d+(?:\.\d+)?kg\s*~\s*\d+(?:\.\d+)?kg",  # 1.8kg~2kg
-    r"\d+(?:\.\d+)?kg",                        # 1kg, 1.5kg
-    r"(?:약\s*)?\d+(?:\.\d+)?g",               # 500g, 약350g
+    r"\d+(?:\.\d+)?kg\s*~\s*\d+(?:\.\d+)?kg",
+    r"\d+(?:\.\d+)?kg",
+    r"(?:약\s*)?\d+(?:\.\d+)?g",
     r"\d+개", r"\d+통", r"\d+단", r"\d+봉", r"\d+팩",
 ]
 UNIT_RE = re.compile(r"(" + "|".join(UNIT_PATTERNS) + r")")
@@ -131,7 +131,6 @@ def default_rules() -> List[Dict]:
 
 
 def load_rules() -> List[Dict]:
-    # 파일이 없으면 최초 1회만 예시 생성(초기화 버튼 없음)
     if not MAPPING_PATH.exists():
         rules = default_rules()
         save_rules(rules)
@@ -169,9 +168,6 @@ def _safe_int(v) -> Optional[int]:
 
 
 def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optional[int]]:
-    """
-    return: (제품명, 매칭성공여부, 합산규칙N or None)
-    """
     actual = normalize_text(actual_name)
     if not actual:
         return "", False, None
@@ -210,7 +206,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
                 sum_rule = None
             return display, True, sum_rule
 
-    # --- fallback: 브랜드/괄호 제거 + 단위 앞까지만 + 접두어 처리(생/유기농...) ---
+    # fallback
     s = re.sub(r"^\s*채소팜\s*", "", actual)
     s = re.sub(r"\([^)]*\)", "", s).strip()
     s = re.sub(r"\s+", " ", s).strip()
@@ -224,7 +220,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
 
     PREFIX = {"생", "유기농", "국산", "수입", "냉동", "베이비", "프리미엄"}
     if len(toks) >= 2 and toks[0] in PREFIX:
-        fallback = toks[0] + toks[1]  # 예: "생 아스파라거스" -> "생아스파라거스"
+        fallback = toks[0] + toks[1]
     else:
         fallback = toks[0]
 
@@ -276,11 +272,7 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
 
 
 def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
-    """
-    columns required: 제품명, 구분, 수량, 합산규칙
-    """
     out = []
-
     for _, r in df_rows.iterrows():
         product = r["제품명"]
         variant = (r.get("구분", "") or "").strip()
@@ -291,7 +283,6 @@ def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
             out.append({"제품명": product, "구분": variant, "수량": qty})
             continue
 
-        # 단위 판단
         if variant == "":
             unit_size, unit_label = 1, "개"
             is_bundle = True
@@ -447,7 +438,7 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 
 # =====================================================
-# PDF 2) 수취인별 출력 (행별로 수취인명 길이에 맞춰 붙이기)
+# PDF 2) 수취인별 출력
 # =====================================================
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
     buf = io.BytesIO()
@@ -526,13 +517,9 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 
 # =====================================================
-# PDF 3) 스티커 용지 (Canvas로 직접 그림)
-#   ✅ 페이지당 65칸(5x13) 고정 + 깔끔한 Bold(Stroke)
+# PDF 3) 스티커 용지 (가이드선 옵션 제거)
 # =====================================================
 def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) -> List[str]:
-    """
-    셀 내부에 들어가도록 최대 2줄로 래핑. 너무 길면 ... 처리
-    """
     txt = (txt or "").strip()
     if not txt:
         return [""]
@@ -543,7 +530,6 @@ def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) ->
     if w(txt) <= max_w_pt:
         return [txt]
 
-    # 공백이 있으면 공백 기준 래핑 시도
     if " " in txt:
         parts = txt.split()
         line1 = ""
@@ -565,7 +551,6 @@ def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) ->
             trimmed = trimmed[:-1]
         return [line1, (trimmed + "...") if trimmed else "..."]
 
-    # 공백이 없으면 글자 단위로 자르기
     line1 = ""
     for ch in txt:
         if w(line1 + ch) <= max_w_pt:
@@ -592,10 +577,6 @@ def _draw_center_text(
     txt: str,
     bold: bool,
 ):
-    """
-    가운데 정렬 텍스트를 출력.
-    bold=True이면 fill+stroke 방식(가능한 경우)으로 깔끔하게 두껍게 출력.
-    """
     txt = (txt or "").strip()
     if not txt:
         return
@@ -608,13 +589,11 @@ def _draw_center_text(
     t.setFont(font_name, font_size)
 
     if bold and STICKER_BOLD and STICKER_BOLD_MODE == "stroke":
-        # 2 = fill + stroke
         try:
-            t.setTextRenderMode(2)
+            t.setTextRenderMode(2)  # fill + stroke
             c.setStrokeColor(colors.black)
             c.setLineWidth(float(STICKER_STROKE_WIDTH))
         except Exception:
-            # setTextRenderMode가 없는 환경이면 그냥 일반 출력(깔끔 우선)
             try:
                 t.setTextRenderMode(0)
             except Exception:
@@ -629,11 +608,7 @@ def _draw_center_text(
     c.drawText(t)
 
 
-def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
-    """
-    A4 / 65칸(5x13) / 38.2x21.1mm
-    label_texts는 '수량만큼 확장된 텍스트 리스트'
-    """
+def build_sticker_pdf(label_texts: List[str]) -> bytes:
     buf = io.BytesIO()
 
     font_name = "Helvetica"
@@ -651,28 +626,16 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     grid_w_pt = cell_w_pt * STICKER_COLS
     grid_h_pt = cell_h_pt * STICKER_ROWS
 
-    # 가운데 정렬(아래 기준)
     x0 = (page_w_pt - grid_w_pt) / 2.0
     y0 = (page_h_pt - grid_h_pt) / 2.0
 
     total = len(label_texts)
     page_count = (total + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if total else 1
 
-    # 셀 안쪽 패딩
     pad_x = 2.0 * mm
     max_text_w = cell_w_pt - (pad_x * 2)
 
     for p in range(page_count):
-        # 가이드선(테두리)
-        if show_grid:
-            c.setLineWidth(0.3)
-            c.setStrokeColor(colors.lightgrey)
-            for r in range(STICKER_ROWS):
-                for col in range(STICKER_COLS):
-                    x = x0 + col * cell_w_pt
-                    y = y0 + (STICKER_ROWS - 1 - r) * cell_h_pt
-                    c.rect(x, y, cell_w_pt, cell_h_pt, stroke=1, fill=0)
-
         c.setFillColor(colors.black)
         c.setFont(font_name, STICKER_FONT_SIZE)
 
@@ -688,7 +651,6 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
                 x = x0 + col * cell_w_pt
                 y = y0 + (STICKER_ROWS - 1 - r) * cell_h_pt
 
-                # 최대 2줄
                 lines = _wrap_for_cell(text, font_name, STICKER_FONT_SIZE, max_text_w)[:2]
 
                 cx = x + cell_w_pt / 2.0
@@ -841,7 +803,6 @@ else:
         st.exception(e)
         st.stop()
 
-    # 필요한 컬럼
     col_name = find_col(raw_df, ["상품명", "상품", "제품명"])
     col_qty = find_col(raw_df, ["수량", "주문수량", "구매수량", "개수"])
     col_buyer = find_col(raw_df, ["구매자명", "구매자"])
@@ -870,7 +831,6 @@ else:
 
     work["상품명"] = work["상품명"].astype(str)
     work["수량"] = pd.to_numeric(work["수량"], errors="coerce")
-
     work["구분"] = work["상품명"].apply(extract_variant)
 
     mapped = work["상품명"].apply(lambda x: apply_mapping(x, rules))
@@ -878,9 +838,6 @@ else:
     work["매칭성공"] = mapped.apply(lambda t: t[1])
     work["합산규칙"] = mapped.apply(lambda t: t[2])
 
-    # -----------------------------
-    # (A) 제품별 집계
-    # -----------------------------
     base = work[(work["수량"].notna()) & (work["제품명"] != "")].copy()
 
     exploded = explode_sum_rule_rows(base[["제품명", "구분", "수량", "합산규칙"]])
@@ -906,30 +863,21 @@ else:
     )
 
     # -----------------------------
-    # (A-2) 스티커 용지 PDF (65칸 고정 + 깔끔한 Bold)
+    # 스티커 PDF: ✅ 가이드선 표시 옵션 제거
     # -----------------------------
     st.markdown("---")
     st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
 
-    show_grid = st.checkbox("가이드선(테두리) 표시", value=False)
-
-    # 가나다 순 정렬 후, 수량만큼 확장
     label_rows = []
     for _, r in summary.iterrows():
         name = str(r["제품명"]).strip()
         var = str(r["구분"]).strip()
-
-        if var in ("", "-", "nan", "None"):
-            label = name
-        else:
-            # 제품명 + 구분 합치기(공백 없이) 예: 가지1개, 건대추500g
-            label = f"{name}{var}"
-
+        label = name if var in ("", "-", "nan", "None") else f"{name}{var}"
         qty = _as_int_qty(r["수량"])
         if qty > 0:
             label_rows.append((label, qty))
 
-    label_rows.sort(key=lambda x: x[0])  # 가나다(유니코드) 순
+    label_rows.sort(key=lambda x: x[0])
 
     sticker_texts: List[str] = []
     for label, qty in label_rows:
@@ -938,10 +886,10 @@ else:
     pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
     st.caption(
         f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 "
-        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold={STICKER_BOLD} / mode={STICKER_BOLD_MODE})"
+        f"(페이지당 65칸 고정 / 글자 {STICKER_FONT_SIZE}pt / Bold={STICKER_BOLD})"
     )
 
-    sticker_pdf = build_sticker_pdf(sticker_texts, show_grid=show_grid)
+    sticker_pdf = build_sticker_pdf(sticker_texts)
     st.download_button(
         "⬇️ 스티커용지 PDF 다운로드",
         data=sticker_pdf,
@@ -951,7 +899,7 @@ else:
     )
 
     # -----------------------------
-    # (B) 수취인별 출력 (새벽/익일 분리 + 새벽 우선)
+    # 수취인별 출력
     # -----------------------------
     st.markdown("---")
     st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (수취인명 길이에 맞춰 옆에 붙이기)")
@@ -979,12 +927,10 @@ else:
             var = str(r["구분"] or "").strip()
             qty = r["수량"]
             sr = _safe_int(r.get("합산규칙", None))
-
             if not prod:
                 continue
             if var == "":
                 var = "-"
-
             key = (prod, var, sr)
             if key not in od:
                 od[key] = 0.0
@@ -993,10 +939,7 @@ else:
             except Exception:
                 pass
 
-        rows = []
-        for (prod, var, sr), q in od.items():
-            rows.append({"제품명": prod, "구분": var, "수량": q, "합산규칙": sr})
-
+        rows = [{"제품명": p, "구분": v, "수량": q, "합산규칙": sr} for (p, v, sr), q in od.items()]
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
         rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
 
@@ -1010,13 +953,9 @@ else:
             except Exception:
                 pass
 
-        parts = []
-        for (pname, v), q2 in od2.items():
-            parts.append(f"{pname}/{v} {fmt_qty(q2)}")
-
+        parts = [f"{pname}/{v} {fmt_qty(q2)}" for (pname, v), q2 in od2.items()]
         recv_name = str(g["수취인명"].iloc[0]).strip()
-        items_line = ", ".join(parts)
-        return recv_name, items_line
+        return recv_name, ", ".join(parts)
 
     group_entries = []
     for _, g in base2.groupby(key_cols, sort=False):
