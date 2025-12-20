@@ -23,14 +23,13 @@ except ModuleNotFoundError:
 from reportlab.platypus import (
     SimpleDocTemplate,
     LongTable,
-    Table,
     TableStyle,
     Paragraph,
     Spacer,
     KeepTogether,
     HRFlowable,
-    PageBreak,
 )
+from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -55,7 +54,7 @@ RECIPIENT_LEADING = 15
 RECIPIENT_BLOCK_GAP_MM = 4.0   # 한 사람 블록 아래 여백(Spacer)
 RECIPIENT_LINE_AFTER_MM = 4.0  # 구분선 아래 여백(spaceAfter)
 
-# 스티커 용지 설정
+# 스티커 용지 설정 (A4 / 65칸 / 38.2x21.1mm)
 STICKER_COLS = 5
 STICKER_ROWS = 13
 STICKER_PER_PAGE = STICKER_COLS * STICKER_ROWS  # 65
@@ -126,6 +125,7 @@ def default_rules() -> List[Dict]:
 
 
 def load_rules() -> List[Dict]:
+    # 파일이 없으면 최초 1회만 예시 생성(초기화 버튼은 없음)
     if not MAPPING_PATH.exists():
         rules = default_rules()
         save_rules(rules)
@@ -520,13 +520,66 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 
 # =====================================================
-# PDF 3) 스티커 용지 (A4 / 65칸 / 38.2x21.1mm)
-#   ✅ 60칸만 나오는 현상 방지: SAFETY_MM로 여백을 살짝 줄여 프레임을 크게 확보
+# PDF 3) 스티커 용지 (Canvas로 직접 그림)
+#   ✅ 60칸만 나오는 문제 근본 해결: Table/Frame 분할 없이 65칸 고정 렌더링
 # =====================================================
+def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) -> List[str]:
+    """
+    셀 내부에 들어가도록 최대 2줄로 래핑. 너무 길면 ... 처리
+    """
+    txt = (txt or "").strip()
+    if not txt:
+        return [""]
+
+    def w(s: str) -> float:
+        return _text_width_pt(s, font_name, font_size)
+
+    if w(txt) <= max_w_pt:
+        return [txt]
+
+    # 공백이 있으면 공백 기준 래핑 시도
+    if " " in txt:
+        parts = txt.split()
+        line1 = ""
+        for p in parts:
+            cand = (line1 + " " + p).strip()
+            if w(cand) <= max_w_pt:
+                line1 = cand
+            else:
+                break
+        rest = txt[len(line1):].strip()
+        if not rest:
+            return [line1]
+        if w(rest) <= max_w_pt:
+            return [line1, rest]
+        # rest를 잘라서 ... 처리
+        trimmed = rest
+        while trimmed and w(trimmed + "...") > max_w_pt:
+            trimmed = trimmed[:-1]
+        return [line1, (trimmed + "...") if trimmed else "..."]
+
+    # 공백이 없으면 글자 단위로 자르기
+    line1 = ""
+    for ch in txt:
+        if w(line1 + ch) <= max_w_pt:
+            line1 += ch
+        else:
+            break
+    rest = txt[len(line1):].strip()
+    if not rest:
+        return [line1]
+    if w(rest) <= max_w_pt:
+        return [line1, rest]
+    trimmed = rest
+    while trimmed and w(trimmed + "...") > max_w_pt:
+        trimmed = trimmed[:-1]
+    return [line1, (trimmed + "...") if trimmed else "..."]
+
+
 def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     """
-    label_texts: 각 스티커 칸에 들어갈 문자열 리스트(이미 수량만큼 확장된 상태)
-    5열 x 13행 = 65칸, 각 칸 38.2 x 21.1mm
+    A4 / 65칸(5x13) / 38.2x21.1mm
+    label_texts는 '수량만큼 확장된 텍스트 리스트'
     """
     buf = io.BytesIO()
 
@@ -537,87 +590,77 @@ def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
     except Exception:
         pass
 
-    page_w_mm = 210.0
-    page_h_mm = 297.0
+    c = canvas.Canvas(buf, pagesize=A4)
+    page_w_pt, page_h_pt = A4
 
-    grid_w_mm = STICKER_COLS * STICKER_CELL_W_MM   # 191.0
-    grid_h_mm = STICKER_ROWS * STICKER_CELL_H_MM   # 274.3
+    cell_w_pt = STICKER_CELL_W_MM * mm
+    cell_h_pt = STICKER_CELL_H_MM * mm
+    grid_w_pt = cell_w_pt * STICKER_COLS
+    grid_h_pt = cell_h_pt * STICKER_ROWS
 
-    # ✅ 핵심: pt 변환 반올림 오차로 마지막 1행이 밀리는 것을 방지하는 안전 여유(mm)
-    SAFETY_MM = 1.0
+    # 가운데 정렬
+    x0 = (page_w_pt - grid_w_pt) / 2.0
+    y0 = (page_h_pt - grid_h_pt) / 2.0  # 아래 기준
 
-    left_margin_mm = max((page_w_mm - grid_w_mm) / 2.0 - SAFETY_MM, 0)
-    right_margin_mm = left_margin_mm
-    top_margin_mm = max((page_h_mm - grid_h_mm) / 2.0 - SAFETY_MM, 0)
-    bottom_margin_mm = top_margin_mm
+    # 페이지당 65개씩
+    total = len(label_texts)
+    page_count = (total + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if total else 1
 
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=left_margin_mm * mm,
-        rightMargin=right_margin_mm * mm,
-        topMargin=top_margin_mm * mm,
-        bottomMargin=bottom_margin_mm * mm,
-    )
+    c.setFont(font_name, STICKER_FONT_SIZE)
 
-    styles = getSampleStyleSheet()
-    cell_style = ParagraphStyle(
-        "cell",
-        parent=styles["Normal"],
-        fontName=font_name,
-        fontSize=STICKER_FONT_SIZE,
-        leading=STICKER_LEADING,
-        alignment=TA_CENTER,
-        spaceAfter=0,
-    )
+    # 셀 안쪽 패딩(pt)
+    pad_x = 2.0 * mm
+    max_text_w = cell_w_pt - (pad_x * 2)
 
-    def chunks(lst, n):
-        for i in range(0, len(lst), n):
-            yield lst[i:i + n]
-
-    elems = []
-    pages = list(chunks(label_texts, STICKER_PER_PAGE))
-    if not pages:
-        pages = [[]]
-
-    col_widths = [STICKER_CELL_W_MM * mm] * STICKER_COLS
-    row_heights = [STICKER_CELL_H_MM * mm] * STICKER_ROWS
-
-    for pi, page_labels in enumerate(pages):
-        data = []
-        idx = 0
-        for _r in range(STICKER_ROWS):
-            row = []
-            for _c in range(STICKER_COLS):
-                if idx < len(page_labels):
-                    txt = (page_labels[idx] or "").strip()
-                    row.append(Paragraph(_xml_escape(txt), cell_style))
-                else:
-                    row.append(Paragraph("", cell_style))
-                idx += 1
-            data.append(row)
-
-        t = Table(data, colWidths=col_widths, rowHeights=row_heights)
-
-        ts = [
-            ("FONTNAME", (0, 0), (-1, -1), font_name),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 1.2 * mm),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 1.2 * mm),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]
+    idx = 0
+    for _p in range(page_count):
+        # 가이드선
         if show_grid:
-            ts.append(("GRID", (0, 0), (-1, -1), 0.2, colors.lightgrey))
+            c.setLineWidth(0.3)
+            c.setStrokeColor(colors.lightgrey)
+            for r in range(STICKER_ROWS):
+                for col in range(STICKER_COLS):
+                    x = x0 + col * cell_w_pt
+                    y = y0 + (STICKER_ROWS - 1 - r) * cell_h_pt
+                    c.rect(x, y, cell_w_pt, cell_h_pt, stroke=1, fill=0)
 
-        t.setStyle(TableStyle(ts))
-        elems.append(t)
+        c.setFillColor(colors.black)
+        c.setFont(font_name, STICKER_FONT_SIZE)
 
-        if pi < len(pages) - 1:
-            elems.append(PageBreak())
+        # 텍스트
+        for r in range(STICKER_ROWS):
+            for col in range(STICKER_COLS):
+                if idx >= total:
+                    idx += 1
+                    continue
 
-    doc.build(elems)
+                text = (label_texts[idx] or "").strip()
+                idx += 1
+
+                x = x0 + col * cell_w_pt
+                y = y0 + (STICKER_ROWS - 1 - r) * cell_h_pt
+
+                # 가운데 정렬 (최대 2줄)
+                lines = _wrap_for_cell(text, font_name, STICKER_FONT_SIZE, max_text_w)
+                lines = lines[:2]
+
+                # 세로 가운데
+                if len(lines) == 1:
+                    ys = [y + (cell_h_pt / 2.0) - (STICKER_FONT_SIZE * 0.35)]
+                else:
+                    # 두 줄이면 위/아래로 살짝 벌려 배치
+                    center = y + (cell_h_pt / 2.0)
+                    gap = (STICKER_LEADING - STICKER_FONT_SIZE) + 1
+                    ys = [center + (gap / 2.0), center - (STICKER_LEADING) + (gap / 2.0)]
+
+                for li, line in enumerate(lines):
+                    c.drawCentredString(x + cell_w_pt / 2.0, ys[min(li, len(ys) - 1)], line)
+
+        if _p < page_count - 1:
+            c.showPage()
+            c.setFont(font_name, STICKER_FONT_SIZE)
+
+    c.save()
     return buf.getvalue()
 
 
@@ -638,6 +681,17 @@ st.sidebar.caption("규칙 파일: data/name_mappings.json")
 # -----------------------------
 if menu == "🧩 상품명 매칭 규칙":
     st.subheader("실제 상품명 → 표시될 상품명 + 합산규칙(개/봉/통/팩)")
+
+    st.markdown(
+        """
+**매칭방식 설명**
+- **contains**: `패턴`이 `엑셀 상품명` 안에 **포함**되어 있으면 매칭 (가장 많이 쓰는 방식)
+- **exact**: `패턴`과 `엑셀 상품명`이 **완전히 동일**할 때만 매칭
+- **regex**: `패턴`을 **정규식**으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
+
+**우선순위(priority)**: 숫자가 **작을수록 먼저 적용**됩니다.
+"""
+    )
 
     rules = load_rules()
     df = pd.DataFrame(rules)
@@ -668,7 +722,7 @@ if menu == "🧩 상품명 매칭 규칙":
         key="mapping_editor",
     )
 
-    c1, c2, c3 = st.columns([1, 1, 2])
+    c1, c2 = st.columns([1, 2])
     with c1:
         if st.button("💾 저장", use_container_width=True):
             cleaned = []
@@ -707,11 +761,6 @@ if menu == "🧩 상품명 매칭 규칙":
             st.success(f"저장 완료! (규칙 {len(cleaned)}개)")
 
     with c2:
-        if st.button("♻️ 기본 예시로 초기화", use_container_width=True):
-            save_rules(default_rules())
-            st.success("기본 예시 규칙으로 초기화했습니다. (새로고침 시 반영)")
-
-    with c3:
         export_bytes = json.dumps(load_rules(), ensure_ascii=False, indent=2).encode("utf-8")
         st.download_button(
             "⬇️ 규칙 내보내기(JSON)",
@@ -812,35 +861,37 @@ else:
     )
 
     # -----------------------------
-    # (A-2) 스티커 용지 PDF
+    # (A-2) 스티커 용지 PDF (65칸 고정)
     # -----------------------------
     st.markdown("---")
     st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
 
     show_grid = st.checkbox("가이드선(테두리) 표시", value=False)
 
-    # 가나다(유니코드) 순으로 정렬 후, 수량만큼 확장
+    # 가나다 순 정렬 후, 수량만큼 확장
     label_rows = []
     for _, r in summary.iterrows():
         name = str(r["제품명"]).strip()
         var = str(r["구분"]).strip()
+
         if var in ("", "-", "nan", "None"):
             label = name
         else:
-            # 예시처럼 "가지1개"가 목표면 아래를 label=f"{name}{var}" 로 바꾸면 됨
-            label = f"{name} {var}".strip()
+            # ✅ 요청: 제품명 + 구분을 합쳐서(공백 없이) 예: 가지1개, 건대추500g
+            label = f"{name}{var}"
+
         qty = _as_int_qty(r["수량"])
         if qty > 0:
             label_rows.append((label, qty))
 
-    label_rows.sort(key=lambda x: x[0])  # 가나다 순
+    label_rows.sort(key=lambda x: x[0])  # 가나다(유니코드) 순
 
     sticker_texts: List[str] = []
     for label, qty in label_rows:
         sticker_texts.extend([label] * qty)
 
     pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
-    st.caption(f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지")
+    st.caption(f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지 (페이지당 65칸 고정)")
 
     sticker_pdf = build_sticker_pdf(sticker_texts, show_grid=show_grid)
     st.download_button(
