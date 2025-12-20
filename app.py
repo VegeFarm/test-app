@@ -23,16 +23,19 @@ except ModuleNotFoundError:
 from reportlab.platypus import (
     SimpleDocTemplate,
     LongTable,
+    Table,
     TableStyle,
     Paragraph,
     Spacer,
     KeepTogether,
     HRFlowable,
+    PageBreak,
 )
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
+from reportlab.lib.enums import TA_CENTER
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
@@ -45,6 +48,21 @@ EXCEL_PASSWORD = "0000"
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
+
+# 수취인별 PDF 스타일(원하면 여기만 수정)
+RECIPIENT_FONT_SIZE = 12
+RECIPIENT_LEADING = 15
+RECIPIENT_BLOCK_GAP_MM = 4.0   # 한 사람 블록 아래 여백(Spacer)
+RECIPIENT_LINE_AFTER_MM = 4.0  # 구분선 아래 여백(spaceAfter)
+
+# 스티커 용지 설정
+STICKER_COLS = 5
+STICKER_ROWS = 13
+STICKER_PER_PAGE = STICKER_COLS * STICKER_ROWS  # 65
+STICKER_CELL_W_MM = 38.2
+STICKER_CELL_H_MM = 21.1
+STICKER_FONT_SIZE = 9
+STICKER_LEADING = 11
 
 
 # =====================================================
@@ -254,9 +272,6 @@ def parse_bundle_variant(variant: str) -> Tuple[Optional[int], Optional[str]]:
 def explode_sum_rule_rows(df_rows: pd.DataFrame) -> pd.DataFrame:
     """
     columns required: 제품명, 구분, 수량, 합산규칙
-    합산규칙(N)이 있는 경우:
-      - 구분이 (n개/봉/통/팩) 기반이면 총 단위를 N묶음 + 나머지(<=N)로 분해
-      - 구분이 비어있으면 1개로 가정(합산규칙 있을 때만)
     """
     out = []
 
@@ -315,12 +330,48 @@ def classify_delivery(opt: str) -> str:
 
 
 def decide_group_delivery(deliv_set: set) -> str:
-    # 새벽+익일 둘 다면 -> 새벽
     if "새벽배송" in deliv_set:
         return "새벽배송"
     if "익일배송" in deliv_set:
         return "익일배송"
     return "기타"
+
+
+# =====================================================
+# PDF helpers
+# =====================================================
+def _xml_escape(s: str) -> str:
+    s = str(s or "")
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _text_width_pt(text: str, font: str, size: float) -> float:
+    try:
+        w = pdfmetrics.stringWidth(text, font, size)
+        if not w or w <= 0:
+            return len(text) * size * 0.55
+        return w
+    except Exception:
+        return len(text) * size * 0.55
+
+
+def fmt_qty(x):
+    try:
+        x = float(x)
+        return int(x) if x.is_integer() else x
+    except Exception:
+        return x
+
+
+def _as_int_qty(v) -> int:
+    try:
+        f = float(v)
+        # 거의 정수면 정수로
+        if abs(f - round(f)) < 1e-9:
+            return int(round(f))
+        return int(round(f))
+    except Exception:
+        return 0
 
 
 # =====================================================
@@ -391,31 +442,10 @@ def build_summary_pdf(summary_df: pd.DataFrame) -> bytes:
 
 
 # =====================================================
-# PDF 2) 수취인별 출력
-#   ✅ 수취인명 길이에 "행별로" 맞춰 주문상품이 바로 옆에 붙음
-#   ✅ 줄바꿈 시 주문상품 시작 위치 아래로 이어짐 (행별 hanging indent)
-#   ✅ 글자 크기 고정, 자동 페이지 넘김, 블록 분리 금지
+# PDF 2) 수취인별 출력 (행별로 수취인명 길이에 맞춰 붙이기)
+#   ✅ 둘째 줄부터는 "주문상품 시작 위치" 밑으로 이어짐 (hanging indent)
 # =====================================================
-def _xml_escape(s: str) -> str:
-    s = str(s or "")
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _text_width_pt(text: str, font: str, size: float) -> float:
-    try:
-        w = pdfmetrics.stringWidth(text, font, size)
-        # 일부 CID 폰트에서 0이 나오는 경우가 있어 fallback
-        if not w or w <= 0:
-            return len(text) * size * 0.55
-        return w
-    except Exception:
-        return len(text) * size * 0.55
-
-
 def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
-    """
-    entries: [{"수취인명": "...", "items_line": "..."}]
-    """
     buf = io.BytesIO()
 
     font_name = "Helvetica"
@@ -444,8 +474,8 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         "base",
         parent=styles["Normal"],
         fontName=font_name,
-        fontSize=12,   # ✅ 고정
-        leading=14,
+        fontSize=RECIPIENT_FONT_SIZE,
+        leading=RECIPIENT_LEADING,
         spaceAfter=0,
     )
 
@@ -456,11 +486,11 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
         recv = (e.get("수취인명") or "").strip() or " "
         items = (e.get("items_line") or "").strip() or " "
 
-        # ✅ 이 행의 "수취인명 - " 너비만큼, 다음 줄부터 그 위치(주문상품 시작점)로 들여쓰기
-        name_token = f"{recv} - "
-        indent = _text_width_pt(name_token, font_name, base_style.fontSize)
+        # 이 행의 "수취인명 - " 너비만큼 들여쓰기(둘째 줄부터)
+        name_token_plain = f"{recv} - "
+        indent = _text_width_pt(name_token_plain, font_name, base_style.fontSize)
 
-        # 너무 길게 잡히면(아주 긴 이름) 주문상품 공간이 너무 좁아지니 합리적 상한만 둠
+        # 너무 긴 이름이면 상한(주문상품 공간 확보)
         indent_cap = usable_width * 0.55
         indent = min(max(indent, 40), indent_cap)
 
@@ -468,25 +498,22 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
             f"line_{abs(hash(recv)) % 10_000_000}",
             parent=base_style,
             leftIndent=indent,
-            firstLineIndent=-indent,   # ✅ 첫 줄은 0에서 시작, 둘째 줄부터 indent 위치에서 시작
+            firstLineIndent=-indent,  # 첫 줄은 0에서 시작, 다음 줄부터 indent 위치
         )
 
-        # 한 문단으로 구성 (줄바꿈 시 hanging indent가 적용됨)
-        # NOTE: <b>는 일부 폰트에서 두께만 바뀌고 폭 계산과 차이가 날 수 있어,
-        #       들여쓰기 정확도가 중요하니 이름은 일반 텍스트로 처리.
-        text = f"{_xml_escape(recv)} - {_xml_escape(items)}"
+        text = f"<b>{_xml_escape(recv)}</b> - {_xml_escape(items)}"
         p = Paragraph(text, line_style)
 
         block = KeepTogether(
             [
                 p,
-                Spacer(1, 4.0 * mm),
+                Spacer(1, RECIPIENT_BLOCK_GAP_MM * mm),
                 HRFlowable(
                     width="100%",
                     thickness=0.4,
                     color=colors.lightgrey,
                     spaceBefore=0,
-                    spaceAfter=4.0 * mm,
+                    spaceAfter=RECIPIENT_LINE_AFTER_MM * mm,
                 ),
             ]
         )
@@ -497,14 +524,104 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 
 # =====================================================
-# Helpers
+# PDF 3) 스티커 용지 (A4 / 65칸 / 38.2x21.1mm)
 # =====================================================
-def fmt_qty(x):
+def build_sticker_pdf(label_texts: List[str], show_grid: bool = False) -> bytes:
+    """
+    label_texts: 각 스티커 칸에 들어갈 문자열 리스트(이미 수량만큼 확장된 상태)
+    5열 x 13행 = 65칸, 각 칸 38.2 x 21.1mm
+    """
+    buf = io.BytesIO()
+
+    font_name = "Helvetica"
     try:
-        x = float(x)
-        return int(x) if x.is_integer() else x
+        pdfmetrics.registerFont(UnicodeCIDFont("HYGothic-Medium"))
+        font_name = "HYGothic-Medium"
     except Exception:
-        return x
+        pass
+
+    page_w_mm = 210.0
+    page_h_mm = 297.0
+
+    grid_w_mm = STICKER_COLS * STICKER_CELL_W_MM
+    grid_h_mm = STICKER_ROWS * STICKER_CELL_H_MM
+
+    # 가운데 정렬되도록 여백 자동 계산
+    left_margin_mm = max((page_w_mm - grid_w_mm) / 2.0, 0)
+    right_margin_mm = left_margin_mm
+    top_margin_mm = max((page_h_mm - grid_h_mm) / 2.0, 0)
+    bottom_margin_mm = top_margin_mm
+
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=left_margin_mm * mm,
+        rightMargin=right_margin_mm * mm,
+        topMargin=top_margin_mm * mm,
+        bottomMargin=bottom_margin_mm * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle(
+        "cell",
+        parent=styles["Normal"],
+        fontName=font_name,
+        fontSize=STICKER_FONT_SIZE,
+        leading=STICKER_LEADING,
+        alignment=TA_CENTER,
+        spaceAfter=0,
+    )
+
+    # 페이지 단위로 쪼개기
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    elems = []
+    pages = list(chunks(label_texts, STICKER_PER_PAGE))
+    if not pages:
+        pages = [[]]
+
+    col_widths = [STICKER_CELL_W_MM * mm] * STICKER_COLS
+    row_heights = [STICKER_CELL_H_MM * mm] * STICKER_ROWS
+
+    for pi, page_labels in enumerate(pages):
+        # 13x5 채우기 (행 우선: 왼→오, 위→아래)
+        data = []
+        idx = 0
+        for _r in range(STICKER_ROWS):
+            row = []
+            for _c in range(STICKER_COLS):
+                if idx < len(page_labels):
+                    txt = (page_labels[idx] or "").strip()
+                    row.append(Paragraph(_xml_escape(txt), cell_style))
+                else:
+                    row.append(Paragraph("", cell_style))
+                idx += 1
+            data.append(row)
+
+        t = Table(data, colWidths=col_widths, rowHeights=row_heights)
+
+        ts = [
+            ("FONTNAME", (0, 0), (-1, -1), font_name),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 1.2 * mm),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 1.2 * mm),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ]
+        if show_grid:
+            ts.append(("GRID", (0, 0), (-1, -1), 0.2, colors.lightgrey))
+
+        t.setStyle(TableStyle(ts))
+        elems.append(t)
+
+        if pi < len(pages) - 1:
+            elems.append(PageBreak())
+
+    doc.build(elems)
+    return buf.getvalue()
 
 
 # =====================================================
@@ -512,7 +629,7 @@ def fmt_qty(x):
 # =====================================================
 st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_icon="📄", layout="wide")
 st.title("📄 제품별 개수 & 수취인별 출력")
-st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(새벽/익일) PDF (엑셀 비밀번호 "0000" 고정)')
+st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(새벽/익일) PDF + 스티커용지 PDF (엑셀 비밀번호 "0000" 고정)')
 
 menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
 st.sidebar.markdown("---")
@@ -698,6 +815,45 @@ else:
     )
 
     # -----------------------------
+    # (A-2) 스티커 용지 PDF
+    # -----------------------------
+    st.markdown("---")
+    st.subheader("🏷️ 스티커용지 PDF (A4 / 65칸 / 38.2×21.1mm)")
+
+    show_grid = st.checkbox("가이드선(테두리) 표시", value=False)
+
+    # 가나다(유니코드) 순으로 정렬 후, 수량만큼 확장
+    label_rows = []
+    for _, r in summary.iterrows():
+        name = str(r["제품명"]).strip()
+        var = str(r["구분"]).strip()
+        if var in ("", "-", "nan", "None"):
+            label = name
+        else:
+            label = f"{name} {var}".strip()
+        qty = _as_int_qty(r["수량"])
+        if qty > 0:
+            label_rows.append((label, qty))
+
+    label_rows.sort(key=lambda x: x[0])  # 가나다 순
+
+    sticker_texts: List[str] = []
+    for label, qty in label_rows:
+        sticker_texts.extend([label] * qty)
+
+    pages_needed = (len(sticker_texts) + STICKER_PER_PAGE - 1) // STICKER_PER_PAGE if sticker_texts else 0
+    st.caption(f"총 스티커 {len(sticker_texts)}개 · {pages_needed}페이지")
+
+    sticker_pdf = build_sticker_pdf(sticker_texts, show_grid=show_grid)
+    st.download_button(
+        "⬇️ 스티커용지 PDF 다운로드",
+        data=sticker_pdf,
+        file_name=f"스티커용지_65칸_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    # -----------------------------
     # (B) 수취인별 출력 (새벽/익일 분리 + 새벽 우선)
     # -----------------------------
     st.markdown("---")
@@ -706,10 +862,8 @@ else:
     base2 = base.copy()
     base2["배송구분"] = base2["옵션정보"].apply(classify_delivery)
 
-    # 같은 주문자인지 판단 키: 구매자명 + 수취인명 + 통합배송지
     key_cols = ["구매자명", "수취인명", "통합배송지"]
 
-    # 그룹별 배송구분 결정(새벽 우선)
     grp_deliv = (
         base2.groupby(key_cols)["배송구분"]
         .agg(lambda x: set(x))
@@ -720,10 +874,8 @@ else:
     base2 = base2.merge(grp_deliv, on=key_cols, how="left")
 
     def build_items_for_group(g: pd.DataFrame) -> Tuple[str, str]:
-        # 엑셀 행 순서 최대한 유지
         g = g.sort_index()
 
-        # (제품명, 구분, 합산규칙) 단위로 합산(순서 보존)
         od = OrderedDict()
         for _, r in g.iterrows():
             prod = str(r["제품명"]).strip()
@@ -734,7 +886,7 @@ else:
             if not prod:
                 continue
             if var == "":
-                var = "-"  # 슬래시 강제 출력 대비
+                var = "-"  # 슬래시 출력 대비
 
             key = (prod, var, sr)
             if key not in od:
@@ -751,7 +903,6 @@ else:
         rows_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["제품명", "구분", "수량", "합산규칙"])
         rows_ex = explode_sum_rule_rows(rows_df[["제품명", "구분", "수량", "합산규칙"]]) if len(rows_df) else rows_df
 
-        # (제품명, 구분) 재합산(표시 순서 유지)
         od2 = OrderedDict()
         for _, r in rows_ex.iterrows():
             k2 = (str(r["제품명"]), str(r["구분"]))
@@ -770,7 +921,6 @@ else:
         items_line = ", ".join(parts)
         return recv_name, items_line
 
-    # 그룹 엔트리 생성
     group_entries = []
     for _, g in base2.groupby(key_cols, sort=False):
         recv_name, items_line = build_items_for_group(g)
@@ -782,7 +932,6 @@ else:
             }
         )
 
-    # 새벽/익일로 분리 (새벽 우선은 그룹배송구분으로 반영됨)
     dawn_entries = [e for e in group_entries if e["그룹배송구분"] == "새벽배송"]
     next_entries = [e for e in group_entries if e["그룹배송구분"] == "익일배송"]
 
