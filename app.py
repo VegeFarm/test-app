@@ -45,7 +45,10 @@ EXCEL_PASSWORD = "0000"
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+
 MAPPING_PATH = DATA_DIR / "name_mappings.json"
+BACKUP_DIR = DATA_DIR / "rules_backup"
+BACKUP_DIR.mkdir(exist_ok=True)
 
 # 수취인별 PDF 스타일(원하면 여기만 수정)
 RECIPIENT_FONT_SIZE = 12
@@ -60,10 +63,10 @@ STICKER_PER_PAGE = STICKER_COLS * STICKER_ROWS  # 65
 STICKER_CELL_W_MM = 38.2
 STICKER_CELL_H_MM = 21.1
 
-# ✅ 스티커 텍스트 스타일 (요청 반영)
-STICKER_FONT_SIZE = 11     # ← 11로 올림
+# ✅ 스티커 텍스트 스타일 (Bold 없음 / 11pt)
+STICKER_FONT_SIZE = 11
 STICKER_LEADING = 13
-STICKER_BOLD = False       # ← Bold 제거
+STICKER_BOLD = False  # (사용 안 함, 유지용)
 
 
 # =====================================================
@@ -95,10 +98,10 @@ def extract_variant(name: str) -> str:
 # RULES (상품명 매칭 + 합산규칙)
 # =====================================================
 def default_rules() -> List[Dict]:
+    # ✅ 우선순위 없음: 규칙은 "위에서 아래 순서대로" 적용됩니다.
     return [
         {
             "enabled": True,
-            "priority": 10,
             "match_type": "contains",
             "pattern": "와일드루꼴라",
             "display_name": "와일드",
@@ -107,7 +110,6 @@ def default_rules() -> List[Dict]:
         },
         {
             "enabled": True,
-            "priority": 20,
             "match_type": "contains",
             "pattern": "라디치오",
             "display_name": "라디치오",
@@ -116,7 +118,6 @@ def default_rules() -> List[Dict]:
         },
         {
             "enabled": False,
-            "priority": 30,
             "match_type": "contains",
             "pattern": "오렌지",
             "display_name": "오렌지",
@@ -164,17 +165,15 @@ def _safe_int(v) -> Optional[int]:
 
 
 def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optional[int]]:
+    """
+    ✅ 우선순위 없음: rules 리스트의 "순서대로" 매칭 → 첫 매칭 1개만 적용
+    return: (제품명, 매칭성공여부, 합산규칙N or None)
+    """
     actual = normalize_text(actual_name)
     if not actual:
         return "", False, None
 
-    def prio(r):
-        try:
-            return int(r.get("priority", 9999))
-        except Exception:
-            return 9999
-
-    for r in sorted(rules, key=prio):
+    for r in rules:
         if not r.get("enabled", True):
             continue
 
@@ -202,7 +201,7 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
                 sum_rule = None
             return display, True, sum_rule
 
-    # fallback
+    # --- fallback ---
     s = re.sub(r"^\s*채소팜\s*", "", actual)
     s = re.sub(r"\([^)]*\)", "", s).strip()
     s = re.sub(r"\s+", " ", s).strip()
@@ -221,6 +220,66 @@ def apply_mapping(actual_name: str, rules: List[Dict]) -> Tuple[str, bool, Optio
         fallback = toks[0]
 
     return fallback, False, None
+
+
+def rules_df_from_list(rules: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rules)
+    # 우선순위 제거(있어도 무시)
+    keep_cols = ["enabled", "match_type", "pattern", "display_name", "sum_rule", "note"]
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[keep_cols]
+    return df
+
+
+def rules_list_from_df(edited: pd.DataFrame) -> List[Dict]:
+    cleaned = []
+    for _, row in edited.iterrows():
+        pattern = normalize_text(row.get("pattern"))
+        display = normalize_text(row.get("display_name"))
+        if not pattern or not display:
+            continue
+
+        mt = normalize_text(row.get("match_type")) or "contains"
+        if mt not in {"contains", "exact", "regex"}:
+            mt = "contains"
+
+        sr = _safe_int(row.get("sum_rule"))
+        if sr is not None and sr < 2:
+            sr = None
+
+        cleaned.append(
+            dict(
+                enabled=bool(row.get("enabled", True)),
+                match_type=mt,
+                pattern=pattern,
+                display_name=display,
+                sum_rule=sr,
+                note=normalize_text(row.get("note")),
+            )
+        )
+    return cleaned
+
+
+def backup_rules_to_excel(rules_list: List[Dict]) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = BACKUP_DIR / f"rules_backup_{ts}.xlsx"
+
+    df = rules_df_from_list(rules_list).copy()
+    # 보기 좋게 한글 헤더
+    df = df.rename(
+        columns={
+            "enabled": "사용",
+            "match_type": "매칭방식",
+            "pattern": "실제상품명(패턴)",
+            "display_name": "표시될상품명",
+            "sum_rule": "합산규칙(N)",
+            "note": "메모",
+        }
+    )
+    df.to_excel(out_path, index=False)
+    return out_path
 
 
 # =====================================================
@@ -513,7 +572,7 @@ def build_recipient_pdf(entries: List[Dict[str, str]]) -> bytes:
 
 
 # =====================================================
-# PDF 3) 스티커 용지 (Bold 제거 + 글자 11pt)
+# PDF 3) 스티커 용지 (Bold 없음 / 11pt)
 # =====================================================
 def _wrap_for_cell(txt: str, font_name: str, font_size: int, max_w_pt: float) -> List[str]:
     txt = (txt or "").strip()
@@ -582,7 +641,6 @@ def _draw_center_text(
     t = c.beginText()
     t.setTextOrigin(x_left, y)
     t.setFont(font_name, font_size)
-    # Bold 제거: 일반 출력
     try:
         t.setTextRenderMode(0)
     except Exception:
@@ -663,8 +721,32 @@ st.title("📄 제품별 개수 & 수취인별 출력")
 st.caption('엑셀 업로드 → (상품명 매칭/합산규칙) → 제품별 집계 + 수취인별(새벽/익일) PDF + 스티커용지 PDF (엑셀 비밀번호 "0000" 고정)')
 
 menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
+
 st.sidebar.markdown("---")
 st.sidebar.caption("규칙 파일: data/name_mappings.json")
+
+# ✅ 사이드바: 규칙 백업 폴더(리스트)
+st.sidebar.markdown("### 📁 규칙 백업폴더")
+try:
+    backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+except Exception:
+    backups = []
+
+if not backups:
+    st.sidebar.caption("아직 백업 파일이 없습니다.")
+else:
+    for i, fp in enumerate(backups[:30]):  # 너무 많아지면 상위 30개만
+        try:
+            b = fp.read_bytes()
+            st.sidebar.download_button(
+                label=f"⬇️ {fp.name}",
+                data=b,
+                file_name=fp.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_backup_{i}_{fp.name}",
+            )
+        except Exception:
+            st.sidebar.caption(f"(읽기 실패) {fp.name}")
 
 
 # -----------------------------
@@ -680,16 +762,13 @@ if menu == "🧩 상품명 매칭 규칙":
 - **exact**: `패턴`과 `엑셀 상품명`이 **완전히 동일**할 때만 매칭
 - **regex**: `패턴`을 **정규식**으로 해석해 매칭 (예: `와일드루꼴라\\s*(250g|500g|1kg)`)
 
-**우선순위(priority)**: 숫자가 **작을수록 먼저 적용**됩니다.
+✅ **우선순위는 제거했습니다.**  
+➡️ 규칙은 **표에 보이는 위→아래 순서대로** 적용되며, **처음 매칭되는 1개**만 적용됩니다.
 """
     )
 
     rules = load_rules()
-    df = pd.DataFrame(rules)
-    for col in ["enabled", "priority", "match_type", "pattern", "display_name", "sum_rule", "note"]:
-        if col not in df.columns:
-            df[col] = None
-    df = df[["enabled", "priority", "match_type", "pattern", "display_name", "sum_rule", "note"]]
+    df = rules_df_from_list(rules)
 
     edited = st.data_editor(
         df,
@@ -698,7 +777,6 @@ if menu == "🧩 상품명 매칭 규칙":
         hide_index=True,
         column_config={
             "enabled": st.column_config.CheckboxColumn("사용", default=True),
-            "priority": st.column_config.NumberColumn("우선순위", help="작을수록 먼저 적용", min_value=0, step=1),
             "match_type": st.column_config.SelectboxColumn("매칭 방식", options=["contains", "exact", "regex"]),
             "pattern": st.column_config.TextColumn("실제 상품명(패턴)", width="large"),
             "display_name": st.column_config.TextColumn("표시될 상품명", width="medium"),
@@ -713,53 +791,19 @@ if menu == "🧩 상품명 매칭 규칙":
         key="mapping_editor",
     )
 
-    c1, c2 = st.columns([1, 2])
+    c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("💾 저장", use_container_width=True):
-            cleaned = []
-            for _, row in edited.iterrows():
-                pattern = normalize_text(row.get("pattern"))
-                display = normalize_text(row.get("display_name"))
-                if not pattern or not display:
-                    continue
-
-                mt = normalize_text(row.get("match_type")) or "contains"
-                if mt not in {"contains", "exact", "regex"}:
-                    mt = "contains"
-
-                try:
-                    pr = int(row.get("priority", 9999))
-                except Exception:
-                    pr = 9999
-
-                sr = _safe_int(row.get("sum_rule"))
-                if sr is not None and sr < 2:
-                    sr = None
-
-                cleaned.append(
-                    dict(
-                        enabled=bool(row.get("enabled", True)),
-                        priority=pr,
-                        match_type=mt,
-                        pattern=pattern,
-                        display_name=display,
-                        sum_rule=sr,
-                        note=normalize_text(row.get("note")),
-                    )
-                )
-
+            cleaned = rules_list_from_df(edited)
             save_rules(cleaned)
             st.success(f"저장 완료! (규칙 {len(cleaned)}개)")
 
     with c2:
-        export_bytes = json.dumps(load_rules(), ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button(
-            "⬇️ 규칙 내보내기(JSON)",
-            data=export_bytes,
-            file_name="name_mappings.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+        if st.button("📗 엑셀로 저장하기(백업)", use_container_width=True):
+            # 현재 편집 상태 그대로 백업 저장(저장 버튼을 안 눌러도 백업 가능)
+            cleaned = rules_list_from_df(edited)
+            outp = backup_rules_to_excel(cleaned)
+            st.success(f"백업 저장 완료: {outp.as_posix()}")
 
     st.info("합산규칙은 개/봉/통/팩 단위에만 적용됩니다. (kg/g 등은 미적용)")
 
@@ -861,7 +905,7 @@ else:
         if qty > 0:
             label_rows.append((label, qty))
 
-    label_rows.sort(key=lambda x: x[0])
+    label_rows.sort(key=lambda x: x[0])  # 가나다(유니코드) 순
 
     sticker_texts: List[str] = []
     for label, qty in label_rows:
@@ -883,7 +927,7 @@ else:
     )
 
     # -----------------------------
-    # 수취인별 출력 (생략: 기존과 동일)
+    # 수취인별 출력
     # -----------------------------
     st.markdown("---")
     st.subheader("📄 수취인별 출력 - 새벽배송 / 익일배송 분리 (수취인명 길이에 맞춰 옆에 붙이기)")
