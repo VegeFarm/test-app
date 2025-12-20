@@ -61,7 +61,7 @@ STICKER_CELL_W_MM = 38.2
 STICKER_CELL_H_MM = 21.1
 
 # ✅ 스티커 텍스트 스타일
-STICKER_FONT_SIZE = 9     # 글자 크기(포인트)
+STICKER_FONT_SIZE = 12     # 글자 크기(포인트)
 STICKER_LEADING = 11
 STICKER_BOLD = True
 
