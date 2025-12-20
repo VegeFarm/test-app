@@ -1,7 +1,5 @@
-streamlit
-pandas
-openpyxl
-reportlab
-pdfplumber
-pypdf
-Pillow
+streamlit>=1.34
+pandas>=2.0
+openpyxl>=3.1
+msoffcrypto-tool>=5.0
+reportlab>=4.0
