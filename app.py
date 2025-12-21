@@ -919,112 +919,213 @@ def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> b
 
 
 # =====================================================
-# Sidebar (상품명 매칭 규칙 메뉴에서만): 백업폴더 + 표현규칙
+# Sidebar (디자인 적용)
 # =====================================================
-def sidebar_backup_folder():
-    with st.sidebar.expander("📁 규칙 백업폴더", expanded=False):
-        try:
-            backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-        except Exception:
-            backups = []
+def inject_sidebar_css():
+    st.markdown(
+        """
+<style>
+/* Sidebar overall */
+section[data-testid="stSidebar"]{
+  background: #f8fafc;
+}
+section[data-testid="stSidebar"] .block-container{
+  padding-top: 0.75rem;
+  padding-bottom: 1.0rem;
+}
 
-        if not backups:
-            st.caption("아직 백업 파일이 없습니다.")
-            return
+/* Titles */
+.sb-title{
+  font-size: 22px;
+  font-weight: 800;
+  margin: 0.25rem 0 0.6rem 0;
+  letter-spacing: -0.2px;
+}
+.sb-divider{
+  height: 1px;
+  background: rgba(15, 23, 42, 0.10);
+  margin: 0.95rem 0;
+}
 
-        for i, fp in enumerate(backups[:60]):
-            cols = st.columns([6, 2, 2])
-            cols[0].write(fp.name)
+/* Menu radio -> button-like cards */
+section[data-testid="stSidebar"] div[role="radiogroup"] label{
+  background: #ffffff;
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  border-radius: 14px;
+  padding: 0.70rem 0.85rem;
+  margin: 0 0 0.55rem 0;
+  box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
+}
+section[data-testid="stSidebar"] div[role="radiogroup"] label:hover{
+  border-color: rgba(15, 23, 42, 0.18);
+}
 
-            try:
-                b = fp.read_bytes()
-                cols[1].download_button(
-                    "다운",
-                    data=b,
-                    file_name=fp.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_bk_{i}_{fp.name}",
-                    use_container_width=True,
-                )
-            except Exception:
-                cols[1].write("")
+/* Hide the default radio dot/indicator */
+section[data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child{
+  display: none !important;
+}
 
-            if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
-                try:
-                    fp.unlink()
-                    st.success(f"삭제 완료: {fp.name}")
-                    st.rerun()
-                except Exception as e:
-                    st.error("삭제 실패")
-                    st.exception(e)
+/* Text style */
+section[data-testid="stSidebar"] div[role="radiogroup"] label p{
+  font-size: 16px;
+  font-weight: 750;
+  margin: 0 !important;
+}
+
+/* Selected state (Chrome/Edge support :has) */
+section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input[type="radio"]:checked){
+  border-color: rgba(59, 130, 246, 0.60);
+  background: rgba(59, 130, 246, 0.07);
+}
+
+/* Expander look */
+section[data-testid="stSidebar"] details{
+  border: 1px solid rgba(15, 23, 42, 0.10);
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 0.20rem 0.45rem;
+}
+section[data-testid="stSidebar"] details summary{
+  font-weight: 750;
+  font-size: 16px;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def sidebar_expression_rules():
+def expression_rules_editor():
+    """사이드바에서 사용할 표현규칙 편집 UI (expander 내부에서 호출)"""
     expr = load_expression_rules()
     units = expr.get("units", [])
     default_unit = normalize_text(expr.get("default_unit", "개")) or "개"
 
-    with st.sidebar.expander("🧩 표현규칙", expanded=False):
-        st.caption("합산규칙(N)을 적용할 단위를 관리합니다. (통/개/팩/봉 등)")
+    st.caption("합산규칙(N)을 적용할 단위를 관리합니다. (통/개/팩/봉 등)")
 
-        df = pd.DataFrame(units)
-        if df.empty:
-            df = pd.DataFrame([{"enabled": True, "unit": default_unit}])
-        if "enabled" not in df.columns:
-            df["enabled"] = True
-        if "unit" not in df.columns:
-            df["unit"] = ""
-        df = df[["enabled", "unit"]]
+    df = pd.DataFrame(units)
+    if df.empty:
+        df = pd.DataFrame([{"enabled": True, "unit": default_unit}])
+    if "enabled" not in df.columns:
+        df["enabled"] = True
+    if "unit" not in df.columns:
+        df["unit"] = ""
+    df = df[["enabled", "unit"]]
 
-        edited = st.data_editor(
-            df,
-            hide_index=True,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "enabled": st.column_config.CheckboxColumn("사용", default=True),
-                "unit": st.column_config.TextColumn("단위"),
-            },
-            key="expr_units_editor",
-        )
+    edited = st.data_editor(
+        df,
+        hide_index=True,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "enabled": st.column_config.CheckboxColumn("사용", default=True),
+            "unit": st.column_config.TextColumn("단위"),
+        },
+        key="expr_units_editor",
+    )
 
-        enabled_units = []
-        for _, r in edited.iterrows():
-            u = normalize_text(r.get("unit", ""))
-            if u:
-                enabled_units.append((bool(r.get("enabled", True)), u))
+    enabled_units = []
+    for _, r in edited.iterrows():
+        u = normalize_text(r.get("unit", ""))
+        if u:
+            enabled_units.append((bool(r.get("enabled", True)), u))
 
-        enabled_only = [u for en, u in enabled_units if en]
-        if not enabled_only:
-            enabled_only = ["개"]
+    enabled_only = [u for en, u in enabled_units if en]
+    if not enabled_only:
+        enabled_only = ["개"]
 
-        if default_unit not in enabled_only:
-            default_unit = enabled_only[0]
+    if default_unit not in enabled_only:
+        default_unit = enabled_only[0]
 
-        new_default = st.selectbox(
-            "기본단위 (구분이 비어있을 때)",
-            options=enabled_only,
-            index=enabled_only.index(default_unit) if default_unit in enabled_only else 0,
-            key="expr_default_unit",
-        )
+    new_default = st.selectbox(
+        "기본단위 (구분이 비어있을 때)",
+        options=enabled_only,
+        index=enabled_only.index(default_unit) if default_unit in enabled_only else 0,
+        key="expr_default_unit",
+    )
 
-        if st.button("💾 표현규칙 저장", use_container_width=True, key="save_expr_rules_btn"):
-            cleaned_units = []
-            seen = set()
-            for en, u in enabled_units:
-                if u in seen:
-                    continue
-                cleaned_units.append({"enabled": bool(en), "unit": u})
-                seen.add(u)
+    if st.button("💾 표현규칙 저장", use_container_width=True, key="save_expr_rules_btn"):
+        cleaned_units = []
+        seen = set()
+        for en, u in enabled_units:
+            if u in seen:
+                continue
+            cleaned_units.append({"enabled": bool(en), "unit": u})
+            seen.add(u)
 
-            data = {
-                "default_unit": new_default,
-                "units": cleaned_units,
-                "note": expr.get("note", ""),
-            }
-            save_expression_rules(data)
-            st.success("표현규칙 저장 완료")
-            st.rerun()
+        data = {
+            "default_unit": new_default,
+            "units": cleaned_units,
+            "note": expr.get("note", ""),
+        }
+        save_expression_rules(data)
+        st.success("표현규칙 저장 완료")
+        st.rerun()
+
+
+def backup_folder_panel():
+    """규칙 백업폴더 UI (expander 내부에서 호출)"""
+    try:
+        backups = sorted(BACKUP_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        backups = []
+
+    if not backups:
+        st.caption("아직 백업 파일이 없습니다.")
+        return
+
+    for i, fp in enumerate(backups[:60]):
+        cols = st.columns([6, 2, 2])
+        cols[0].write(fp.name)
+
+        try:
+            b = fp.read_bytes()
+            cols[1].download_button(
+                "다운",
+                data=b,
+                file_name=fp.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_bk_{i}_{fp.name}",
+                use_container_width=True,
+            )
+        except Exception:
+            cols[1].write("")
+
+        if cols[2].button("삭제", key=f"rm_bk_{i}_{fp.name}", use_container_width=True):
+            try:
+                fp.unlink()
+                st.success(f"삭제 완료: {fp.name}")
+                st.rerun()
+            except Exception as e:
+                st.error("삭제 실패")
+                st.exception(e)
+
+
+def sidebar_layout() -> str:
+    """스크린샷 스타일 사이드바 레이아웃. 선택된 메뉴(문자열)를 반환."""
+    st.sidebar.markdown('<div class="sb-title">📌 메뉴</div>', unsafe_allow_html=True)
+
+    # ✅ 기존 2개 페이지를 스크린샷처럼 이름만 바꿔 노출
+    page = st.sidebar.radio(
+        label="",
+        options=["📄 PDF 제품별합계", "📦 재고관리"],
+        index=0,
+        key="nav_menu",
+        label_visibility="collapsed",
+    )
+
+    st.sidebar.markdown('<div class="sb-divider"></div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="sb-title">⚙️ 표현 규칙(기본값 + 수정 가능)</div>', unsafe_allow_html=True)
+
+    with st.sidebar.expander("🧩 PACK/BOX/EA 규칙", expanded=False):
+        expression_rules_editor()
+
+    # (옵션) 재고관리(=규칙관리) 페이지에서만 백업폴더 노출
+    if page == "📦 재고관리":
+        with st.sidebar.expander("📁 규칙 백업폴더", expanded=False):
+            backup_folder_panel()
+
+    return page
 
 
 # =====================================================
@@ -1034,15 +1135,15 @@ st.set_page_config(page_title="제품별 개수 & 수취인별 출력", page_ico
 st.title("📄 제품별 개수 & 수취인별 출력")
 st.caption("엑셀 업로드 → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF + TC주문_등록양식 자동작성")
 
-menu = st.sidebar.radio("메뉴", ["🧩 상품명 매칭 규칙", "⬆️ 엑셀 업로드 & 결과"], index=1)
-st.sidebar.markdown("---")
+# ✅ 사이드바 디자인(스크린샷 스타일)
+inject_sidebar_css()
+page = sidebar_layout()
+
 
 # -----------------------------
 # 1) 상품명 매칭 규칙
 # -----------------------------
-if menu == "🧩 상품명 매칭 규칙":
-    sidebar_backup_folder()
-    sidebar_expression_rules()
+if page == "📦 재고관리":
 
     mapping_rules = load_mapping_rules()
     expr = load_expression_rules()
