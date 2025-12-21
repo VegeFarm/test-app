@@ -1376,6 +1376,10 @@ else:
     with st.expander("✅ 결과 (제품명 / 구분 / 수량) 펼쳐보기", expanded=False):
         st.dataframe(summary, use_container_width=True, height=520)
 
+    with st.expander("⚠️ 미매칭/누락 행 보기 (규칙 추가용)", expanded=False):
+        bad = work[(work["매칭성공"] == False) | (work["수량"].isna())].copy()
+        st.dataframe(bad.head(300), use_container_width=True)
+
     st.download_button(
         "⬇️ 제품별 개수 PDF 다운로드",
         data=build_summary_pdf(summary),
@@ -1383,10 +1387,6 @@ else:
         mime="application/pdf",
         use_container_width=True,
     )
-
-    with st.expander("⚠️ 미매칭/누락 행 보기 (규칙 추가용)", expanded=False):
-        bad = work[(work["매칭성공"] == False) | (work["수량"].isna())].copy()
-        st.dataframe(bad.head(300), use_container_width=True)
 
     # 스티커 PDF
     st.markdown("---")
