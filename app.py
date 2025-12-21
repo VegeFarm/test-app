@@ -680,98 +680,18 @@ st.set_page_config(
     layout="wide",
 )
 
-# ----- Sidebar style -----
-st.markdown(
-    """
-    <style>
-    /* Sidebar spacing */
-    section[data-testid="stSidebar"] .block-container {
-        padding-top: 1.2rem;
-        padding-bottom: 1.2rem;
-    }
-
-    /* ---- Menu (radio -> card buttons) ---- */
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"]{
-        gap: 0.55rem;
-    }
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"] > label{
-        background: #ffffff;
-        border: 1px solid rgba(0,0,0,0.10);
-        border-radius: 14px;
-        padding: 0.75rem 0.9rem;
-        margin: 0;
-        box-shadow: 0 1px 0 rgba(0,0,0,0.03);
-        cursor: pointer;
-        transition: all 0.12s ease-in-out;
-        width: 100%;
-    }
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"] > label:hover{
-        background: #f8fafc;
-        border-color: rgba(0,0,0,0.16);
-        transform: translateY(-1px);
-    }
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"] > label p{
-        font-size: 1rem;
-        font-weight: 650;
-        margin: 0;
-        line-height: 1.2;
-    }
-
-    /* Hide the default radio circle without breaking selection */
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"] > label input{
-        position: absolute;
-        opacity: 0;
-        width: 0;
-        height: 0;
-    }
-
-    /* Selected state (Chrome supports :has) */
-    section[data-testid="stSidebar"] .stRadio [role="radiogroup"] > label:has(input:checked){
-        border-color: rgba(0,0,0,0.26);
-        background: #fbfbfd;
-    }
-
-    /* ---- Expander header -> card style ---- */
-    section[data-testid="stSidebar"] details > summary{
-        background: #ffffff;
-        border: 1px solid rgba(0,0,0,0.10);
-        border-radius: 14px;
-        padding: 0.70rem 0.85rem;
-        box-shadow: 0 1px 0 rgba(0,0,0,0.03);
-        transition: all 0.12s ease-in-out;
-    }
-    section[data-testid="stSidebar"] details > summary:hover{
-        background: #f8fafc;
-        border-color: rgba(0,0,0,0.16);
-        transform: translateY(-1px);
-    }
-    section[data-testid="stSidebar"] details > summary p{
-        font-weight: 650;
-        margin: 0;
-    }
-
-    /* Divider (thin) */
-    section[data-testid="stSidebar"] hr{
-        margin: 1.0rem 0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
 # ----- Navigation -----
 if "page" not in st.session_state:
     st.session_state["page"] = "pdf_sum"
 
 with st.sidebar:
     st.markdown("## 📌 메뉴")
-    st.radio(
-        label="",
-        options=["pdf_sum", "inventory"],
-        format_func=lambda x: "📄 PDF 제품별합계" if x == "pdf_sum" else "📦 재고관리",
-        key="page",
-        label_visibility="collapsed",
-    )
+    if st.button("📄 PDF 제품별합계", use_container_width=True):
+        st.session_state["page"] = "pdf_sum"
+        st.rerun()
+    if st.button("📦 재고관리", use_container_width=True):
+        st.session_state["page"] = "inventory"
+        st.rerun()
     st.divider()
 
 
