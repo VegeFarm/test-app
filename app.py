@@ -489,17 +489,174 @@ def decrypt_excel(uploaded_bytes: bytes, password: str = EXCEL_PASSWORD) -> io.B
     return decrypted
 
 
+def _norm_col(x) -> str:
+    s = str(x if x is not None else "")
+    s = s.replace("\xa0", " ").replace("\n", " ").replace("\r", " ")
+    return normalize_text(s)
+
+
 def find_col(df: pd.DataFrame, keywords: List[str]) -> Optional[str]:
+    """컬럼명 탐색: 공백/개행/NBSP 등을 정규화해서 매칭합니다."""
     cols = list(df.columns)
-    for k in keywords:
-        if k in cols:
-            return k
-    for c in cols:
-        cs = str(c)
-        for k in keywords:
-            if k in cs:
+    if not cols:
+        return None
+
+    kw_norm = [_norm_col(k) for k in (keywords or []) if _norm_col(k)]
+    if not kw_norm:
+        return None
+
+    col_norm = [_norm_col(c) for c in cols]
+
+    # 1) 정규화 후 완전일치
+    for k in kw_norm:
+        for c, cn in zip(cols, col_norm):
+            if k == cn:
                 return c
+
+    # 2) 정규화 후 부분일치
+    for c, cn in zip(cols, col_norm):
+        for k in kw_norm:
+            if k in cn:
+                return c
+
     return None
+
+
+# =====================================================
+# ✅ Smart Excel header detection (안내문이 위에 있는 엑셀 자동 처리)
+# =====================================================
+REQUIRED_COL_GROUPS = OrderedDict(
+    [
+        ("상품명", ["상품명", "상품", "제품명"]),
+        ("수량", ["수량", "주문수량", "구매수량", "개수"]),
+        ("구매자명", ["구매자명", "구매자"]),
+        ("수취인명", ["수취인명", "수령인", "받는사람"]),
+        ("통합배송지", ["통합배송지", "배송지", "주소"]),
+        ("옵션정보", ["옵션정보", "옵션", "선택옵션"]),
+        ("수취인연락처", ["수취인연락처", "수령인연락처", "수취인 연락처", "수령인 연락처", "전화번호", "연락처"]),
+        ("배송메세지", ["배송메세지", "배송메시지", "배송 메시지", "배송 메세지", "배송요청사항", "요청사항"]),
+    ]
+)
+
+
+def _missing_required_cols(df: pd.DataFrame) -> List[str]:
+    missing = []
+    for k, kws in REQUIRED_COL_GROUPS.items():
+        if find_col(df, kws) is None:
+            missing.append(k)
+    return missing
+
+
+def _guess_header_row(preview: pd.DataFrame, scan_limit: int = 40) -> Tuple[Optional[int], int]:
+    """header=None 로 읽은 preview에서 '헤더로 보이는 행'을 추정"""
+    if preview is None or preview.empty:
+        return None, 0
+
+    best_i = None
+    best_score = -1
+
+    n = min(scan_limit, len(preview))
+    for i in range(n):
+        row = preview.iloc[i].tolist()
+        row_strs = []
+        for v in row:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            s = _norm_col(v)
+            if s:
+                row_strs.append(s)
+
+        if not row_strs:
+            continue
+
+        score = 0
+        for _, kws in REQUIRED_COL_GROUPS.items():
+            hit = False
+            for kw in kws:
+                kw_n = _norm_col(kw)
+                if not kw_n:
+                    continue
+                if any(kw_n in cell for cell in row_strs):
+                    hit = True
+                    break
+            if hit:
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    return best_i, max(best_score, 0)
+
+
+def smart_read_orders_excel(excel_bytes: bytes, min_score: int = 4) -> Tuple[pd.DataFrame, Dict]:
+    """
+    스마트스토어/일괄발송 엑셀처럼 상단에 안내문이 있는 경우,
+    '헤더 행'을 자동으로 찾아서 DataFrame을 반환합니다.
+    """
+    if not excel_bytes:
+        raise ValueError("empty excel bytes")
+
+    def _read(sheet, header, nrows=None):
+        bio = io.BytesIO(excel_bytes)
+        bio.seek(0)
+        return pd.read_excel(bio, sheet_name=sheet, header=header, nrows=nrows, engine="openpyxl")
+
+    # 시트 목록
+    bio0 = io.BytesIO(excel_bytes)
+    bio0.seek(0)
+    xls = pd.ExcelFile(bio0, engine="openpyxl")
+
+    best_fallback = None  # (df, meta)
+
+    for sheet in xls.sheet_names:
+        # 1) 일반 header=0 시도
+        try:
+            df0 = _read(sheet, header=0)
+            df0 = df0.dropna(how="all")
+            missing0 = _missing_required_cols(df0)
+            if not missing0:
+                return df0, {"sheet": sheet, "header_row": 0, "method": "header=0"}
+            if best_fallback is None:
+                best_fallback = (df0, {"sheet": sheet, "header_row": 0, "method": "header=0", "missing": missing0})
+        except Exception:
+            pass
+
+        # 2) header 행 추정
+        try:
+            preview = _read(sheet, header=None, nrows=60)
+            header_row, score = _guess_header_row(preview, scan_limit=40)
+
+            if header_row is None or score < min_score:
+                continue
+
+            df = _read(sheet, header=int(header_row))
+            df = df.dropna(how="all")
+
+            # 빈 컬럼 제거(Unnamed: n)
+            try:
+                df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+            except Exception:
+                pass
+
+            missing = _missing_required_cols(df)
+            if not missing:
+                return df, {"sheet": sheet, "header_row": int(header_row), "method": f"guessed(score={score})"}
+
+            if best_fallback is None:
+                best_fallback = (
+                    df,
+                    {"sheet": sheet, "header_row": int(header_row), "method": f"guessed(score={score})", "missing": missing},
+                )
+        except Exception:
+            pass
+
+    if best_fallback is not None:
+        return best_fallback
+
+    # 최후의 수단
+    df_last = _read(0, header=0)
+    return df_last, {"sheet": 0, "header_row": 0, "method": "fallback"}
 
 
 # =====================================================
@@ -1145,12 +1302,18 @@ else:
     req_day_str = req_day.strftime("%Y-%m-%d")
 
     try:
-        decrypted = decrypt_excel(uploaded.getvalue(), password=EXCEL_PASSWORD)
-        raw_df = pd.read_excel(decrypted, sheet_name=0, engine="openpyxl")
+        decrypted_io = decrypt_excel(uploaded.getvalue(), password=EXCEL_PASSWORD)
+        excel_bytes = decrypted_io.getvalue()
+        raw_df, read_meta = smart_read_orders_excel(excel_bytes)
+
     except Exception as e:
         st.error('엑셀 읽기/복호화 실패: 비밀번호 "0000" 또는 파일 형식을 확인해 주세요.')
         st.exception(e)
         st.stop()
+
+    # (디버그) 안내문이 위에 있는 엑셀은 헤더를 자동 탐지합니다.
+    if isinstance(read_meta, dict) and read_meta.get("method") != "header=0":
+        st.caption(f"📌 헤더 자동탐지: sheet={read_meta.get('sheet')} / header_row={read_meta.get('header_row')} / {read_meta.get('method')}")
 
     col_name = find_col(raw_df, ["상품명", "상품", "제품명"])
     col_qty = find_col(raw_df, ["수량", "주문수량", "구매수량", "개수"])
