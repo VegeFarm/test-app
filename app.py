@@ -5218,9 +5218,6 @@ def render_invoice_bulk_send_page():
         try:
             import openpyxl
 
-# -------------------- UI icon (송장일괄발송) --------------------
-INVOICE_ICON_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACMElEQVR4nO3Wu49NURQG8N99zIwh8yIx4hUJChqiIP4CUWgoNURUWolKQhQKjf+HUKuEhjCV5HpNgiGDmGuu4uwTe/bse86dh2nMl5zsddZa+7vf3XvtdTab2MRyDPXxD6M5wPx2Rd4QGqsR9c+QU3MVezCv+DfQwl7cQSfM62W4ejiHM3gX8S9gAg/xqErQk0DS77kWCUpRLvvbGo4LVQJ6uFiVsEZ08Cl2tDNJ8ysgbKMb7CYWa/J/4lvsyFXr5AoEdCO77sdhTFJ3OQGNJHbY34I7G9nnFYVW4kQUO4m5PiJqBfxOYgei2O0wjuI0dkWxU5F9FOMZ7kVLVy0rYF+UDO+j2EwYf+BFMq8T2R8yvDCNI7EjV4SzYWxZvq/xe9pDBqmB55IVSAXEpF3rh5Zia4+lgarenms2q0XaNQcSsCFIBRyP7PXcgrI+Dkr6TCrgKW4FezhDVPUprVrNct4MPseB3CkoE7qZnNGKufF7eqcoa+ArvseBnOq5JBY3m7EwthTNJsZ0ZE9leCm+BV/6xFAovZz4RnEv2OO4H+xDuBnlTUSxKdzN8H/EqzoBV6oS1ohZvIwduS14U0NS7m/T0n1vqL/vdbA1duSK8BIeKI7kgqKDjWA7HgcfxdFK228POxX1MRfeGyHvmaITvq5SeF31depGyKu6kv2q4dhRJaDEhKIPjIRnG/YPMjFgN7YEjqEwTq5g/sYhVzStPn6Keuj7YQlo6t8Vc3Xzn+MP1gB4XQ1Y704AAAAASUVORK5CYII="
-
             from openpyxl.styles import Font, Alignment
         except Exception:
             # worst-case: CSV
