@@ -15,6 +15,10 @@ import pandas as pd
 import streamlit as st
 import openpyxl
 
+# -------------------- UI icon (송장일괄발송) --------------------
+INVOICE_ICON_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACMElEQVR4nO3Wu49NURQG8N99zIwh8yIx4hUJChqiIP4CUWgoNURUWolKQhQKjf+HUKuEhjCV5HpNgiGDmGuu4uwTe/bse86dh2nMl5zsddZa+7vf3XvtdTab2MRyDPXxD6M5wPx2Rd4QGqsR9c+QU3MVezCv+DfQwl7cQSfM62W4ejiHM3gX8S9gAg/xqErQk0DS77kWCUpRLvvbGo4LVQJ6uFiVsEZ08Cl2tDNJ8ysgbKMb7CYWa/J/4lvsyFXr5AoEdCO77sdhTFJ3OQGNJHbY34I7G9nnFYVW4kQUO4m5PiJqBfxOYgei2O0wjuI0dkWxU5F9FOMZ7kVLVy0rYF+UDO+j2EwYf+BFMq8T2R8yvDCNI7EjV4SzYWxZvq/xe9pDBqmB55IVSAXEpF3rh5Zia4+lgarenms2q0XaNQcSsCFIBRyP7PXcgrI+Dkr6TCrgKW4FezhDVPUprVrNct4MPseB3CkoE7qZnNGKufF7eqcoa+ArvseBnOq5JBY3m7EwthTNJsZ0ZE9leCm+BV/6xFAovZz4RnEv2OO4H+xDuBnlTUSxKdzN8H/EqzoBV6oS1ohZvIwduS14U0NS7m/T0n1vqL/vdbA1duSK8BIeKI7kgqKDjWA7HgcfxdFK228POxX1MRfeGyHvmaITvq5SeF31depGyKu6kv2q4dhRJaDEhKIPjIRnG/YPMjFgN7YEjqEwTq5g/sYhVzStPn6Keuj7YQlo6t8Vc3Xzn+MP1gB4XQ1Y704AAAAASUVORK5CYII="
+
+
 # -------------------- Optional deps --------------------
 # Excel decrypt (SmartStore password 0000)
 try:
@@ -2304,9 +2308,23 @@ with st.sidebar:
     if st.button("📦 재고관리", use_container_width=True):
         st.session_state["page"] = "inventory"
         st.rerun()
-    if st.button("📦 송장일괄발송", use_container_width=True):
-        st.session_state["page"] = "invoice_bulk_send"
-        st.rerun()
+
+    # ✅ 송장일괄발송: 이모티콘 대신 커스텀 이미지 아이콘 사용
+    col_icon, col_btn = st.columns([1, 7], gap="small")
+    with col_icon:
+        st.markdown(
+            f"""
+            <div style='display:flex;align-items:center;justify-content:center;height:2.4rem;'>
+              <img src='data:image/png;base64,{INVOICE_ICON_PNG_B64}' width='18'/>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with col_btn:
+        if st.button("송장일괄발송", use_container_width=True, key="nav_invoice_bulk_send"):
+            st.session_state["page"] = "invoice_bulk_send"
+            st.rerun()
+
     if st.button("🧰 재고일괄변경", use_container_width=True):
         st.session_state["page"] = "bulk_stock"
         st.rerun()
@@ -5008,7 +5026,16 @@ def render_bulk_stock_page():
 # Invoice Bulk Send Page (송장일괄발송)  ✅ 2.py 기능 이식
 # =====================================================
 def render_invoice_bulk_send_page():
-    st.title("📦 송장일괄발송")
+    # ✅ 타이틀도 동일 아이콘으로 표시
+    st.markdown(
+        f"""
+        <div style='display:flex;align-items:center;gap:10px;'>
+          <img src='data:image/png;base64,{INVOICE_ICON_PNG_B64}' width='28'/>
+          <h1 style='margin:0;padding:0;'>송장일괄발송</h1>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.caption("스마트스토어(비번 0000) 엑셀 + 운송장/출고 엑셀을 매칭해서 '일괄발송' 업로드 파일을 만듭니다. (가능하면 .xls)")
 
     if msoffcrypto is None:
@@ -5190,6 +5217,10 @@ def render_invoice_bulk_send_page():
         # 2) Fallback: .xlsx
         try:
             import openpyxl
+
+# -------------------- UI icon (송장일괄발송) --------------------
+INVOICE_ICON_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACMElEQVR4nO3Wu49NURQG8N99zIwh8yIx4hUJChqiIP4CUWgoNURUWolKQhQKjf+HUKuEhjCV5HpNgiGDmGuu4uwTe/bse86dh2nMl5zsddZa+7vf3XvtdTab2MRyDPXxD6M5wPx2Rd4QGqsR9c+QU3MVezCv+DfQwl7cQSfM62W4ejiHM3gX8S9gAg/xqErQk0DS77kWCUpRLvvbGo4LVQJ6uFiVsEZ08Cl2tDNJ8ysgbKMb7CYWa/J/4lvsyFXr5AoEdCO77sdhTFJ3OQGNJHbY34I7G9nnFYVW4kQUO4m5PiJqBfxOYgei2O0wjuI0dkWxU5F9FOMZ7kVLVy0rYF+UDO+j2EwYf+BFMq8T2R8yvDCNI7EjV4SzYWxZvq/xe9pDBqmB55IVSAXEpF3rh5Zia4+lgarenms2q0XaNQcSsCFIBRyP7PXcgrI+Dkr6TCrgKW4FezhDVPUprVrNct4MPseB3CkoE7qZnNGKufF7eqcoa+ArvseBnOq5JBY3m7EwthTNJsZ0ZE9leCm+BV/6xFAovZz4RnEv2OO4H+xDuBnlTUSxKdzN8H/EqzoBV6oS1ohZvIwduS14U0NS7m/T0n1vqL/vdbA1duSK8BIeKI7kgqKDjWA7HgcfxdFK228POxX1MRfeGyHvmaITvq5SeF31depGyKu6kv2q4dhRJaDEhKIPjIRnG/YPMjFgN7YEjqEwTq5g/sYhVzStPn6Keuj7YQlo6t8Vc3Xzn+MP1gB4XQ1Y704AAAAASUVORK5CYII="
+
             from openpyxl.styles import Font, Alignment
         except Exception:
             # worst-case: CSV
