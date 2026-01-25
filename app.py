@@ -4,7 +4,7 @@ import re
 import json
 import math
 import shutil
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -2282,39 +2282,6 @@ def compute_product_totals_from_summary(
 # =====================================================
 # Streamlit UI (1번 코드 레이아웃 유지)
 # =====================================================
-
-# =====================================================
-# Sidebar icon (송장일괄발송)
-# =====================================================
-# - 파일이 있으면 파일을 우선 사용하고,
-# - 없으면(배포 환경에서 파일 누락 대비) 코드에 내장된 base64 아이콘을 사용합니다.
-_INVOICE_FAVICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACMElEQVR4nO3Wu49NURQG8N99zIwh8yIx4hUJChqiIP4CUWgoNURUWolKQhQKjf+HUKuEhjCV5HpNgiGDmGuu4uwTe/bse86dh2nMl5zsddZa+7vf3XvtdTab2MRyDPXxD6M5wPx2Rd4QGqsR9c+QU3MVezCv+DfQwl7cQSfM62W4ejiHM3gX8S9gAg/xqErQk0DS77kWCUpRLvvbGo4LVQJ6uFiVsEZ08Cl2tDNJ8ysgbKMb7CYWa/J/4lvsyFXr5AoEdCO77sdhTFJ3OQGNJHbY34I7G9nnFYVW4kQUO4m5PiJqBfxOYgei2O0wjuI0dkWxU5F9FOMZ7kVLVy0rYF+UDO+j2EwYf+BFMq8T2R8yvDCNI7EjV4SzYWxZvq/xe9pDBqmB55IVSAXEpF3rh5Zia4+lgarenms2q0XaNQcSsCFIBRyP7PXcgrI+Dkr6TCrgKW4FezhDVPUprVrNct4MPseB3CkoE7qZnNGKufF7eqcoa+ArvseBnOq5JBY3m7EwthTNJsZ0ZE9leCm+BV/6xFAovZz4RnEv2OO4H+xDuBnlTUSxKdzN8H/EqzoBV6oS1ohZvIwduS14U0NS7m/T0n1vqL/vdbA1duSK8BIeKI7kgqKDjWA7HgcfxdFK228POxX1MRfeGyHvmaITvq5SeF31depGyKu6kv2q4dhRJaDEhKIPjIRnG/YPMjFgN7YEjqEwTq5g/sYhVzStPn6Keuj7YQlo6t8Vc3Xzn+MP1gB4XQ1Y704AAAAASUVORK5CYII="
-
-def load_invoice_favicon_bytes() -> bytes | None:
-    """송장일괄발송 메뉴용 아이콘 PNG(bytes)"""
-    from pathlib import Path
-    import base64
-
-    candidates = [
-        Path("assets/invoice_favicon.png"),
-        Path("assets/favicon_invoice.png"),
-        Path("favicon.png"),
-        Path("assets/favicon.png"),
-    ]
-    for p in candidates:
-        try:
-            if p.exists():
-                b = p.read_bytes()
-                if b:
-                    return b
-        except Exception:
-            continue
-
-    try:
-        return base64.b64decode(_INVOICE_FAVICON_B64)
-    except Exception:
-        return None
-
 st.set_page_config(
     page_title="재고프로그램",
     page_icon="assets/favicon.png",  # ✅ 1번 코드 파비콘/디자인 유지
@@ -2337,19 +2304,9 @@ with st.sidebar:
     if st.button("📦 재고관리", use_container_width=True):
         st.session_state["page"] = "inventory"
         st.rerun()
-
-    # ✅ 송장일괄발송 (재고관리 ↔ 재고일괄변경 사이)
-    _invoice_icon_bytes = load_invoice_favicon_bytes()
-    _icon_col, _btn_col = st.columns([1, 9])
-    with _icon_col:
-        if _invoice_icon_bytes:
-            st.image(_invoice_icon_bytes, width=20)
-        else:
-            st.write("📄")
-    with _btn_col:
-        if st.button("송장일괄발송", use_container_width=True, key="nav_invoice_bulk_send"):
-            st.session_state["page"] = "invoice_bulk_send"
-            st.rerun()
+    if st.button("📦 송장일괄발송", use_container_width=True):
+        st.session_state["page"] = "invoice_bulk_send"
+        st.rerun()
     if st.button("🧰 재고일괄변경", use_container_width=True):
         st.session_state["page"] = "bulk_stock"
         st.rerun()
@@ -5048,419 +5005,309 @@ def render_bulk_stock_page():
 
 
 # =====================================================
-# Invoice Bulk Send Page (송장일괄발송)  ✅ 2.py 기능 통합
+# Invoice Bulk Send Page (송장일괄발송)  ✅ 2.py 기능 이식
 # =====================================================
-_INVOICE_ROMAN_MAP = str.maketrans({
-    "Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
-    "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10",
-    "ⅰ": "1", "ⅱ": "2", "ⅲ": "3", "ⅳ": "4", "ⅴ": "5",
-    "ⅵ": "6", "ⅶ": "7", "ⅷ": "8", "ⅸ": "9", "ⅹ": "10",
-})
-
-
-def _invoice_norm_text(s) -> str:
-    """공백/특수문자 제거 + 로마숫자(Ⅱ 등) 숫자로 변환."""
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    s = str(s).strip().translate(_INVOICE_ROMAN_MAP)
-    s = re.sub(r"\s+", "", s)
-    s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)
-    return s
-
-
-def _invoice_to_plain_number_str(x) -> str:
-    """3.13936E+11 같은 표기를 '313936000000'처럼 보이게 변환."""
-    if x is None:
-        return ""
-    try:
-        if isinstance(x, float) and pd.isna(x):
-            return ""
-    except Exception:
-        pass
-
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return ""
-
-    s = s.replace(",", "")
-    if re.fullmatch(r"-?\d+\.0+", s):  # '123.0' 형태
-        return s.split(".")[0]
-
-    try:
-        d = Decimal(s)
-        if d == d.to_integral():
-            return format(d.to_integral(), "f")
-        plain = format(d, "f").rstrip("0").rstrip(".")
-        return plain
-    except Exception:
-        return s
-
-
-def _invoice_to_plain_tracking_str(x) -> str:
-    """운송장번호: '-' 있으면 그대로, 숫자면 과학표기 방지 변환."""
-    if x is None:
-        return ""
-    try:
-        if isinstance(x, float) and pd.isna(x):
-            return ""
-    except Exception:
-        pass
-
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return ""
-
-    if "-" in s:
-        return s
-    return _invoice_to_plain_number_str(s)
-
-
-def _invoice_is_zip_xlsx(file_bytes: bytes) -> bool:
-    return file_bytes[:4] == b"PK\x03\x04"
-
-
-def _invoice_decrypt_excel_bytes(file_bytes: bytes, password: str = EXCEL_PASSWORD) -> io.BytesIO:
-    """
-    - 일반 xlsx(zip)이면 그대로 반환
-    - 암호화된 Office 엑셀이면(msoffcrypto) 복호화 후 BytesIO 반환
-    """
-    if _invoice_is_zip_xlsx(file_bytes):
-        return io.BytesIO(file_bytes)
+def render_invoice_bulk_send_page():
+    st.title("📦 송장일괄발송")
+    st.caption("스마트스토어(비번 0000) 엑셀 + 운송장/출고 엑셀을 매칭해서 '일괄발송' 업로드 파일을 만듭니다. (가능하면 .xls)")
 
     if msoffcrypto is None:
-        raise RuntimeError("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가해 주세요.")
+        st.error("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가하고 재배포해 주세요.")
+        st.stop()
 
-    decrypted = io.BytesIO()
-    office = msoffcrypto.OfficeFile(io.BytesIO(file_bytes))
-    office.load_key(password=password)
-    office.decrypt(decrypted)
-    decrypted.seek(0)
-    return decrypted
+    # -------------------------
+    # Helpers (scoped to this page to avoid name collisions)
+    # -------------------------
+    ROMAN_MAP = str.maketrans({
+        "Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
+        "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10",
+        "ⅰ": "1", "ⅱ": "2", "ⅲ": "3", "ⅳ": "4", "ⅴ": "5",
+        "ⅵ": "6", "ⅶ": "7", "ⅷ": "8", "ⅸ": "9", "ⅹ": "10",
+    })
 
+    def inv_norm_text(s) -> str:
+        """공백/특수문자 제거 + 로마숫자(Ⅱ 등) 숫자로 변환."""
+        if s is None or (isinstance(s, float) and pd.isna(s)):
+            return ""
+        s = str(s).strip().translate(ROMAN_MAP)
+        s = re.sub(r"\s+", "", s)
+        s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)
+        return s
 
-def _invoice_find_header_row(df: pd.DataFrame, must_have: tuple[str, ...], max_scan: int = 30) -> int:
-    """header=None로 읽은 df에서 컬럼명 행을 찾는다."""
-    scan = min(max_scan, len(df))
-    for i in range(scan):
-        row = df.iloc[i].astype(str).tolist()
-        if all(any(m in cell for cell in row) for m in must_have):
-            return i
-    return -1
+    def inv_to_plain_number_str(x) -> str:
+        """3.13936E+11 같은 표기를 '313936000000'처럼 보이게 변환."""
+        if x is None:
+            return ""
+        try:
+            if isinstance(x, float) and pd.isna(x):
+                return ""
+        except Exception:
+            pass
 
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return ""
 
-def _invoice_choose_tracking(series: pd.Series) -> str | None:
-    """같은 key에서 운송장번호가 여러 개면 최빈값(동률이면 먼저 나온 값) 선택"""
-    s = series.dropna().astype(str)
-    if s.empty:
-        return None
-    vc = s.value_counts()
-    top = vc.max()
-    candidates = vc[vc == top].index.tolist()
-    if len(candidates) == 1:
+        s = s.replace(",", "")
+        if re.fullmatch(r"-?\d+\.0+", s):  # '123.0' 형태
+            return s.split(".")[0]
+
+        try:
+            d = Decimal(s)
+            if d == d.to_integral():
+                return format(d.to_integral(), "f")
+            plain = format(d, "f").rstrip("0").rstrip(".")
+            return plain
+        except (InvalidOperation, ValueError):
+            return s
+
+    def inv_to_plain_tracking_str(x) -> str:
+        """운송장번호: '-' 있으면 그대로, 숫자면 과학표기 방지 변환."""
+        if x is None:
+            return ""
+        try:
+            if isinstance(x, float) and pd.isna(x):
+                return ""
+        except Exception:
+            pass
+
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return ""
+        if "-" in s:
+            return s
+        return inv_to_plain_number_str(s)
+
+    def inv_find_header_row(df: pd.DataFrame, must_have: tuple[str, ...], max_scan: int = 30) -> int:
+        """header=None 로 읽은 df에서 컬럼명 행을 찾습니다."""
+        scan = min(max_scan, len(df))
+        for i in range(scan):
+            row = df.iloc[i].astype(str).tolist()
+            if all(any(m in cell for cell in row) for m in must_have):
+                return i
+        return -1
+
+    def inv_choose_tracking(series: pd.Series) -> str | None:
+        """같은 key에서 운송장번호가 여러 개면 최빈값(동률이면 먼저 나온 값) 선택"""
+        s = series.dropna().astype(str)
+        if s.empty:
+            return None
+        vc = s.value_counts()
+        top = vc.max()
+        candidates = vc[vc == top].index.tolist()
+        if len(candidates) == 1:
+            return candidates[0]
+        for v in s:  # tie-break: 먼저 나온 값
+            if v in candidates:
+                return v
         return candidates[0]
-    for v in s:  # tie-break: 먼저 나온 값
-        if v in candidates:
-            return v
-    return candidates[0]
 
+    def inv_build_output(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        # 1번에서 필요한 컬럼
+        col_buyer = "구매자명"
+        col_recv = "수취인명"
+        col_addr = "통합배송지"
+        col_po = "상품주문번호"
 
-def _invoice_build_output(df1: pd.DataFrame, df2: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # 1번(스마트스토어)에서 필요한 컬럼
-    col_buyer = "구매자명"
-    col_recv = "수취인명"
-    col_addr = "통합배송지"
-    col_po = "상품주문번호"
+        # 2번에서 필요한 컬럼
+        col2_buyer = "주문자"
+        col2_recv = "수령자"
+        col2_addr = "수령자 주소(상세포함)"
+        col2_track = "운송장번호"
 
-    # 2번(운송장/출고)에서 필요한 컬럼
-    col2_buyer = "주문자"
-    col2_recv = "수령자"
-    col2_addr = "수령자 주소(상세포함)"
-    col2_track = "운송장번호"
+        df1 = df1.copy()
+        df2 = df2.copy()
 
-    df1 = df1.copy()
-    df2 = df2.copy()
+        # 주문자/수령자/주소가 같으면 같은 송장번호로 묶기 위한 key
+        df1["__key"] = df1[col_buyer].map(inv_norm_text) + "|" + df1[col_recv].map(inv_norm_text) + "|" + df1[col_addr].map(inv_norm_text)
+        df2["__key"] = df2[col2_buyer].map(inv_norm_text) + "|" + df2[col2_recv].map(inv_norm_text) + "|" + df2[col2_addr].map(inv_norm_text)
 
-    # 주문자/수령자/주소가 같으면 같은 송장번호로 묶기 위한 key
-    df1["__key"] = (
-        df1[col_buyer].map(_invoice_norm_text)
-        + "|"
-        + df1[col_recv].map(_invoice_norm_text)
-        + "|"
-        + df1[col_addr].map(_invoice_norm_text)
-    )
-    df2["__key"] = (
-        df2[col2_buyer].map(_invoice_norm_text)
-        + "|"
-        + df2[col2_recv].map(_invoice_norm_text)
-        + "|"
-        + df2[col2_addr].map(_invoice_norm_text)
-    )
+        # key → 운송장번호 매핑 (같은 key가 여러 개면 최빈값)
+        map_track: dict[str, str | None] = df2.groupby("__key")[col2_track].apply(inv_choose_tracking).to_dict()
+        df1["송장번호"] = df1["__key"].map(map_track)
 
-    # key → 운송장번호 매핑
-    map_track: Dict[str, str | None] = df2.groupby("__key")[col2_track].apply(_invoice_choose_tracking).to_dict()
-    df1["송장번호"] = df1["__key"].map(map_track)
+        # 참고용: 같은 key에서 운송장번호가 여러 개인 경우
+        dup_info = (
+            df2.groupby("__key")[col2_track]
+            .nunique(dropna=True)
+            .reset_index(name="운송장번호_종류수")
+            .query("운송장번호_종류수 > 1")
+            .sort_values("운송장번호_종류수", ascending=False)
+        )
 
-    # 참고용: 같은 key에서 운송장번호가 여러 개인 경우
-    dup_info = (
-        df2.groupby("__key")[col2_track]
-        .nunique(dropna=True)
-        .reset_index(name="운송장번호_종류수")
-        .query("운송장번호_종류수 > 1")
-        .sort_values("운송장번호_종류수", ascending=False)
-    )
+        df1["_상품주문번호_plain"] = df1[col_po].apply(inv_to_plain_number_str)
+        df1["_송장번호_plain"] = df1["송장번호"].apply(inv_to_plain_tracking_str)
 
-    df1["_상품주문번호_plain"] = df1[col_po].apply(_invoice_to_plain_number_str)
-    df1["_송장번호_plain"] = df1["송장번호"].apply(_invoice_to_plain_tracking_str)
-
-    out = pd.DataFrame(
-        {
+        out = pd.DataFrame({
             "상품주문번호": df1["_상품주문번호_plain"],
-            # ✅ (스마트스토어 업로드 xls는 드롭다운 제약) 기본값은 택배,등기,소포
-            "배송방법": ["택배,등기,소포"] * len(df1),
+            "배송방법": "택배,등기,소포",  # ✅ 기본값 (스마트스토어 드롭다운 제약 고려)
             "택배사": df1["_송장번호_plain"].apply(
                 lambda x: "컬리넥스트마일" if "-" in str(x) else ("롯데택배" if str(x).strip() else "")
             ),
             "송장번호": df1["_송장번호_plain"],
-        }
-    )
-    return out, dup_info
+        })
+        return out, dup_info
 
+    def inv_export_xls_or_xlsx(out_df: pd.DataFrame) -> tuple[bytes, str, str]:
+        """
+        우선 .xls(xlwt)로 생성 시도 → 없으면 .xlsx(openpyxl)로 대체.
+        Returns: (bytes, filename, mime)
+        """
+        # 1) Try .xls via xlwt
+        try:
+            import xlwt  # type: ignore
+        except Exception:
+            xlwt = None
 
-def _invoice_export_result(out_df: pd.DataFrame) -> tuple[bytes, str, str]:
-    """
-    반환: (file_bytes, file_name, mime)
-    - xlwt가 있으면 .xls 생성
-    - 없으면 .xlsx로 대체 생성(단, 스마트스토어가 .xls만 받는 경우 xlwt 설치 필요)
-    """
-    # 1) Prefer .xls (xlwt)
-    try:
-        import xlwt  # type: ignore
+        if xlwt is not None:
+            wb = xlwt.Workbook()
+            ws = wb.add_sheet("발송처리")
 
-        wb = xlwt.Workbook()
-        ws = wb.add_sheet("발송처리")
+            header_style = xlwt.easyxf("font: bold on; align: horiz center, vert center;")
+            center_style = xlwt.easyxf("align: horiz center, vert center;")
+            left_style = xlwt.easyxf("align: horiz left, vert center;")
 
-        header_style = xlwt.easyxf("font: bold on; align: horiz center, vert center;")
-        center_style = xlwt.easyxf("align: horiz center, vert center;")
-        left_style = xlwt.easyxf("align: horiz left, vert center;")
+            col_widths = [24, 10, 16, 32]  # 대략
+            for c, w in enumerate(col_widths):
+                ws.col(c).width = int(w * 256)
 
-        col_widths = [24, 10, 16, 32]
-        for c, w in enumerate(col_widths):
-            ws.col(c).width = int(w * 256)
+            for c, name in enumerate(out_df.columns):
+                ws.write(0, c, name, header_style)
 
-        for c, name in enumerate(out_df.columns):
-            ws.write(0, c, name, header_style)
+            for r, row in enumerate(out_df.itertuples(index=False), start=1):
+                vals = list(row)
+                for c, v in enumerate(vals):
+                    v_str = "" if v is None else str(v)
+                    if c in (0, 3):  # A(상품주문번호), D(송장번호) -> 문자열로 기록(과학표기 방지)
+                        ws.write(r, c, v_str, left_style)
+                    else:
+                        ws.write(r, c, v_str, center_style)
 
-        for r, row in enumerate(out_df.itertuples(index=False), start=1):
+            bio = io.BytesIO()
+            wb.save(bio)
+            return bio.getvalue(), "송장일괄발송.xls", "application/vnd.ms-excel"
+
+        # 2) Fallback: .xlsx
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, Alignment
+        except Exception:
+            # worst-case: CSV
+            csv_bytes = out_df.to_csv(index=False).encode("utf-8-sig")
+            return csv_bytes, "송장일괄발송.csv", "text/csv"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "발송처리"
+
+        bold = Font(bold=True)
+        center = Alignment(horizontal="center", vertical="center")
+        left = Alignment(horizontal="left", vertical="center")
+
+        # header
+        for c, name in enumerate(out_df.columns, start=1):
+            cell = ws.cell(row=1, column=c, value=str(name))
+            cell.font = bold
+            cell.alignment = center
+
+        # rows
+        for r, row in enumerate(out_df.itertuples(index=False), start=2):
             vals = list(row)
-            for c, v in enumerate(vals):
+            for c, v in enumerate(vals, start=1):
                 v_str = "" if v is None else str(v)
-                if c in (0, 3):  # A(상품주문번호), D(송장번호) => 문자열로
-                    ws.write(r, c, v_str, left_style)
-                else:
-                    ws.write(r, c, v_str, center_style)
+                cell = ws.cell(row=r, column=c, value=v_str)
+                cell.alignment = left if c in (1, 4) else center
 
-        bio = io.BytesIO()
-        wb.save(bio)
-        return bio.getvalue(), "송장일괄발송.xls", "application/vnd.ms-excel"
-    except Exception:
-        pass
-
-    # 2) Fallback .xlsx
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        out_df.astype(str).to_excel(writer, index=False, sheet_name="발송처리")
-        ws = writer.sheets["발송처리"]
-        ws.freeze_panes = "A2"
-        # 폭(대략)
+        # column widths
         widths = [24, 14, 18, 32]
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
-        # 문자열로 강제(과학표기 방지)
-        try:
-            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-                for cell in row:
-                    if cell.value is None:
-                        continue
-                    cell.value = str(cell.value)
-        except Exception:
-            pass
+        bio = io.BytesIO()
+        wb.save(bio)
+        return bio.getvalue(), "송장일괄발송.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-    return bio.getvalue(), "송장일괄발송.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    st.markdown("- 1번 파일은 **비밀번호 0000 고정**으로 열어서 처리합니다.")
+    st.markdown("- 3번 결과는 **가능하면 xls**, 환경에 따라 xlsx로 내려갈 수 있습니다. (xls 필요 시 requirements에 `xlwt` 추가)")
 
-
-def render_invoice_bulk_send_page():
-    st.title("📦 송장일괄발송")
-    st.caption("스마트스토어 엑셀(비번 0000) + 운송장/출고 엑셀을 매칭해서 일괄발송 업로드 파일을 생성합니다.")
     st.markdown("---")
+    st.markdown("### 1) 스마트스토어 엑셀(비번0000)")
+    f1 = st.file_uploader("스마트스토어 엑셀 업로드", type=["xlsx"], key="invoice_ss_file")
 
-    st.markdown(
-        """
-- **1번 파일(스마트스토어)**: 비밀번호 **0000 고정**으로 복호화해서 처리합니다.  
-- **결과 파일**: 기본은 **.xls** 생성(가능할 때). 환경에 `xlwt`가 없으면 **.xlsx로 대체**됩니다.
-        """
+    st.markdown("### 2) 운송장/출고 엑셀")
+    f2 = st.file_uploader("운송장/출고 엑셀 업로드", type=["xlsx", "xls"], key="invoice_tracking_file")
+
+    run = st.button("자동 채우기", type="primary", disabled=(f1 is None or f2 is None))
+
+    if not run:
+        return
+
+    # 1) decrypt + read header=None
+    try:
+        decrypted_io = decrypt_excel(f1.getvalue(), password=EXCEL_PASSWORD)
+        raw1 = pd.read_excel(decrypted_io, header=None, engine="openpyxl")
+    except Exception as e:
+        st.error("1번 파일을 열지 못했습니다. 비밀번호(0000) 또는 파일 형식을 확인해 주세요.")
+        st.exception(e)
+        st.stop()
+
+    header_idx = inv_find_header_row(raw1, must_have=("구매자명", "수취인명", "통합배송지", "상품주문번호"))
+    if header_idx < 0:
+        st.error("1번 파일에서 컬럼명 행(구매자명/수취인명/통합배송지/상품주문번호)을 찾지 못했습니다.")
+        st.stop()
+
+    header = raw1.iloc[header_idx].tolist()
+    df1 = raw1.iloc[header_idx + 1 :].copy()
+    df1.columns = header
+    df1 = df1.reset_index(drop=True)
+
+    # 2) read tracking excel
+    try:
+        ext = str(getattr(f2, "name", "")).lower()
+        if ext.endswith(".xlsx"):
+            df2 = pd.read_excel(f2, engine="openpyxl")
+        else:
+            # .xls -> needs xlrd (pandas)
+            df2 = pd.read_excel(f2)
+    except Exception as e:
+        st.error("2번 파일을 읽지 못했습니다. (.xls인 경우 xlrd가 필요할 수 있어요)")
+        st.exception(e)
+        st.stop()
+
+    need1 = {"구매자명", "수취인명", "통합배송지", "상품주문번호"}
+    need2 = {"주문자", "수령자", "수령자 주소(상세포함)", "운송장번호"}
+
+    if not need1.issubset(set(df1.columns)):
+        st.error(f"1번 파일에 필요한 컬럼이 없습니다: {sorted(list(need1 - set(df1.columns)))}")
+        st.stop()
+
+    if not need2.issubset(set(df2.columns)):
+        st.error(f"2번 파일에 필요한 컬럼이 없습니다: {sorted(list(need2 - set(df2.columns)))}")
+        st.stop()
+
+    out_df, dup_info = inv_build_output(df1, df2)
+
+    with st.expander("미리보기 (상위 30건) — 클릭해서 접기/펼치기", expanded=False):
+        st.dataframe(out_df.head(30), use_container_width=True)
+
+    miss = (out_df["송장번호"].isna() | (out_df["송장번호"].astype(str).str.strip() == "")).sum()
+    st.write(f"총 {len(out_df)}건 / 송장번호 누락 {miss}건")
+
+    if not dup_info.empty:
+        with st.expander("⚠️ (참고) 같은 주문자/수령자/주소인데 운송장번호가 여러 개인 경우", expanded=False):
+            st.dataframe(dup_info.head(50), use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("3) 결과 다운로드")
+
+    out_bytes, out_name, out_mime = inv_export_xls_or_xlsx(out_df)
+    st.download_button(
+        "✅ 일괄발송 엑셀 다운로드",
+        data=out_bytes,
+        file_name=out_name,
+        mime=out_mime,
+        use_container_width=True,
     )
-
-    # 결과 유지(다운로드 편의)
-    if "invoice_result" not in st.session_state:
-        st.session_state["invoice_result"] = None
-
-    st.markdown(
-        """
-<style>
-.upload-title { font-size: 20px; font-weight: 700; margin-bottom: 2px; }
-.result-title { font-size: 22px; font-weight: 800; margin-top: 8px; }
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown('<div class="upload-title">1) 스마트스토어 엑셀(비번0000)</div>', unsafe_allow_html=True)
-    f1 = st.file_uploader(
-        label="스마트스토어 엑셀 업로드",
-        type=["xlsx"],
-        key="invoice_smartstore_file",
-        label_visibility="collapsed",
-    )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    st.markdown('<div class="upload-title">2) 운송장/출고 엑셀</div>', unsafe_allow_html=True)
-    f2 = st.file_uploader(
-        label="운송장/출고 엑셀 업로드",
-        type=["xlsx", "xls"],
-        key="invoice_tracking_file",
-        label_visibility="collapsed",
-    )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    run = st.button("자동 채우기", type="primary", disabled=(f1 is None or f2 is None), key="invoice_run_btn")
-
-    def _try_read_tracking_excel(uploaded) -> pd.DataFrame:
-        """운송장/출고 엑셀 읽기 (.xlsx/.xls)"""
-        b = uploaded.getvalue()
-        name = (uploaded.name or "").lower()
-
-        # xlsx 우선
-        try:
-            bio = io.BytesIO(b)
-            bio.seek(0)
-            return pd.read_excel(bio, engine="openpyxl")
-        except Exception:
-            pass
-
-        # xls (xlrd 필요)
-        if name.endswith(".xls"):
-            try:
-                import xlrd  # type: ignore
-
-                bio = io.BytesIO(b)
-                bio.seek(0)
-                return pd.read_excel(bio, engine="xlrd")
-            except Exception as e:
-                raise RuntimeError(
-                    "2번 파일이 .xls 형식이면 'xlrd'가 필요합니다. "
-                    "가능하면 2번 파일을 .xlsx로 저장해서 업로드하거나, requirements.txt에 'xlrd'를 추가해 주세요."
-                ) from e
-
-        # 그 외 실패
-        raise RuntimeError("2번 파일을 읽지 못했습니다. 파일 형식을 확인해 주세요. (권장: .xlsx)")
-
-    if run:
-        if msoffcrypto is None:
-            st.error("msoffcrypto가 설치되지 않았습니다. requirements.txt에 'msoffcrypto-tool'을 추가하고 재배포해 주세요.")
-            st.stop()
-
-        # 1번 decrypt + read
-        try:
-            decrypted = _invoice_decrypt_excel_bytes(f1.getvalue(), password=EXCEL_PASSWORD)
-            raw1 = pd.read_excel(decrypted, header=None, engine="openpyxl")
-        except Exception as e:
-            st.error("1번 파일을 열지 못했습니다. 비밀번호(0000) 또는 파일 형식을 확인해 주세요.")
-            st.exception(e)
-            st.stop()
-
-        header_idx = _invoice_find_header_row(raw1, must_have=("구매자명", "수취인명", "통합배송지", "상품주문번호"))
-        if header_idx < 0:
-            st.error("1번 파일에서 컬럼명 행(구매자명/수취인명/통합배송지/상품주문번호)을 찾지 못했습니다.")
-            st.stop()
-
-        header = raw1.iloc[header_idx].tolist()
-        df1 = raw1.iloc[header_idx + 1 :].copy()
-        df1.columns = header
-        df1 = df1.reset_index(drop=True)
-
-        # 2번 read
-        try:
-            df2 = _try_read_tracking_excel(f2)
-        except Exception as e:
-            st.error("2번 파일을 읽지 못했습니다.")
-            st.exception(e)
-            st.stop()
-
-        need1 = {"구매자명", "수취인명", "통합배송지", "상품주문번호"}
-        need2 = {"주문자", "수령자", "수령자 주소(상세포함)", "운송장번호"}
-
-        if not need1.issubset(set(df1.columns)):
-            st.error(f"1번 파일에 필요한 컬럼이 없습니다: {sorted(list(need1 - set(df1.columns)))}")
-            st.stop()
-        if not need2.issubset(set(df2.columns)):
-            st.error(f"2번 파일에 필요한 컬럼이 없습니다: {sorted(list(need2 - set(df2.columns)))}")
-            st.stop()
-
-        out_df, dup_info = _invoice_build_output(df1, df2)
-
-        file_bytes, file_name, mime = _invoice_export_result(out_df)
-
-        st.session_state["invoice_result"] = {
-            "out_df": out_df,
-            "dup_info": dup_info,
-            "file_bytes": file_bytes,
-            "file_name": file_name,
-            "mime": mime,
-            "generated_at": datetime.now(KST_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    # ----- Show result if exists -----
-    res = st.session_state.get("invoice_result")
-    if res:
-        out_df = res.get("out_df")
-        dup_info = res.get("dup_info")
-
-        st.success(f"완료! (생성 시간: {res.get('generated_at', '')})")
-
-        with st.expander("미리보기 (상위 30건) — 클릭해서 접기/펼치기", expanded=False):
-            try:
-                st.dataframe(out_df.head(30), use_container_width=True)
-            except Exception:
-                pass
-
-        try:
-            miss = (out_df["송장번호"].isna() | (out_df["송장번호"].astype(str).str.strip() == "")).sum()
-            st.write(f"총 {len(out_df)}건 / 송장번호 누락 {int(miss)}건")
-        except Exception:
-            pass
-
-        try:
-            if isinstance(dup_info, pd.DataFrame) and (not dup_info.empty):
-                with st.expander("⚠️ (참고) 같은 주문자/수령자/주소인데 운송장번호가 여러 개인 경우"):
-                    st.dataframe(dup_info.head(50), use_container_width=True)
-        except Exception:
-            pass
-
-        st.markdown('<div class="result-title">3) 결과 다운로드</div>', unsafe_allow_html=True)
-
-        st.download_button(
-            "✅ 일괄발송 엑셀 다운로드",
-            data=res.get("file_bytes") or b"",
-            file_name=res.get("file_name") or "송장일괄발송.xls",
-            mime=res.get("mime") or "application/octet-stream",
-        )
-
-        # xlwt가 없어서 xlsx로 대체된 경우 안내
-        if str(res.get("file_name", "")).lower().endswith(".xlsx"):
-            st.info("현재 실행 환경에 'xlwt'가 없어 .xls 대신 .xlsx로 저장했습니다. 스마트스토어가 .xls만 받는 경우 requirements.txt에 'xlwt'를 추가해 주세요.")
 
 
 # =====================================================
