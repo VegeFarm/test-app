@@ -1,0 +1,21 @@
+[1번코드 웹앱 연동 설정]
+
+1) 2번 코드(Apps Script)를 웹앱으로 배포하고 /exec 주소를 준비합니다.
+2) Render 환경변수에 아래 2개를 넣습니다.
+   - GOOGLE_SYNC_WEBAPP_URL = https://script.google.com/macros/s/...../exec
+   - GOOGLE_SYNC_TOKEN = 본인이 정한 임의의 토큰
+3) 필요하면 타임아웃도 설정할 수 있습니다.
+   - GOOGLE_SYNC_TIMEOUT = 20
+4) 재배포 후, 제품별합계 > 재고등록에서 1차/2차/3차를 선택해 등록하면
+   로컬 재고표 저장 + 2번 코드 날짜 시트(M.dd) 동기화가 같이 실행됩니다.
+
+[이번 완성본 동작]
+- 품목명 exact match만 반영
+- 오늘 날짜 시트(M.dd) 기준
+- 시트 없으면 2번 코드 쪽에서 넣지 않음
+- 1번 코드 기존 로컬 재고등록은 유지
+
+[추가된 환경변수]
+- GOOGLE_SYNC_WEBAPP_URL
+- GOOGLE_SYNC_TOKEN
+- GOOGLE_SYNC_TIMEOUT (선택)
