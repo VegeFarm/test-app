@@ -320,12 +320,6 @@ def render_invoice_register_page():
         df1 = df1.copy()
         df2 = df2.copy()
 
-        skipped_cancelled = 0
-        if col2_status:
-            cancel_mask = df2[col2_status].map(inv_clean_header_text) == "배송취소"
-            skipped_cancelled = int(cancel_mask.sum())
-            df2 = df2.loc[~cancel_mask].reset_index(drop=True)
-
         df1["__key"] = (
             df1[col_buyer].map(inv_norm_text)
             + "|"
@@ -340,6 +334,18 @@ def render_invoice_register_page():
             + "|"
             + df2[col2_addr].map(inv_norm_text)
         )
+
+        skipped_cancelled = 0
+        cancelled_keys = set()
+        if col2_status:
+            cancel_mask = df2[col2_status].map(inv_clean_header_text) == "배송취소"
+            skipped_cancelled = int(cancel_mask.sum())
+            cancelled_keys = set(
+                k for k in df2.loc[cancel_mask, "__key"].dropna().astype(str).tolist()
+                if k and k != "||"
+            )
+            df2 = df2.loc[~cancel_mask].reset_index(drop=True)
+
         df2["__송장번호_plain"] = df2[col2_track].apply(inv_to_plain_tracking_str)
         df2 = df2.loc[df2["__송장번호_plain"].astype(str).str.strip() != ""].reset_index(drop=True)
 
@@ -356,6 +362,21 @@ def render_invoice_register_page():
 
         df1["송장번호"] = df1["__key"].map(lambda k: track_records.get(k, {}).get("tracking", ""))
         df1["__배송사_raw"] = df1["__key"].map(lambda k: track_records.get(k, {}).get("courier_raw", ""))
+
+        # 운송장/출고 엑셀에서 배송 취소로 내려온 주문은
+        # 네이버 송장일괄발송 결과물에서도 아예 제외합니다.
+        # 단, 같은 주문자/수령자/주소에 배송 취소와 출고 진행중이 함께 있으면
+        # 출고 진행중 운송장번호가 존재하므로 제외하지 않고 정상 출력합니다.
+        active_keys = {
+            k for k, v in track_records.items()
+            if str(v.get("tracking", "")).strip()
+        }
+        cancelled_only_keys = cancelled_keys - active_keys
+        result_excluded_cancelled = 0
+        if cancelled_only_keys:
+            exclude_cancelled_mask = df1["__key"].isin(cancelled_only_keys)
+            result_excluded_cancelled = int(exclude_cancelled_mask.sum())
+            df1 = df1.loc[~exclude_cancelled_mask].reset_index(drop=True)
 
         dup_info = (
             df2.groupby("__key")["__송장번호_plain"]
@@ -384,7 +405,7 @@ def render_invoice_register_page():
                 "송장번호": df1["_송장번호_plain"],
             }
         )
-        return out, dup_info, skipped_cancelled
+        return out, dup_info, skipped_cancelled, result_excluded_cancelled
 
     def inv_read_tracking_file(excel_source, password: str) -> Tuple[pd.DataFrame, int]:
         errors = []
@@ -467,43 +488,44 @@ def render_invoice_register_page():
     inv_settings = inv_load_settings()
     with st.sidebar:
         st.markdown("---")
-        st.subheader("운송장 비밀번호 설정")
-        tracking_password_input = st.text_input(
-            "운송장/출고 엑셀 비밀번호",
-            value=str(inv_settings.get("tracking_password", INV_TRACKING_PASSWORD_DEFAULT)),
-            type="password",
-            key="invoice_tracking_password_setting",
-            help="이 비밀번호로 2번 운송장/출고 엑셀을 자동으로 엽니다.",
-        )
-
-        st.subheader("운송장 배송사 출력 설정")
-        st.caption("운송장/출고 엑셀의 배송사 값이 넥스트마일 또는 롯데일 때, 결과 엑셀의 택배사명을 아래 값으로 바꿔 넣습니다.")
-        courier_nextmile_input = st.text_input(
-            "넥스트마일 → 결과 택배사",
-            value=str(inv_settings.get("courier_nextmile", INV_COURIER_NEXTMILE_DEFAULT)),
-            key="invoice_courier_nextmile_setting",
-        )
-        courier_lotte_input = st.text_input(
-            "롯데 → 결과 택배사",
-            value=str(inv_settings.get("courier_lotte", INV_COURIER_LOTTE_DEFAULT)),
-            key="invoice_courier_lotte_setting",
-        )
-
-        if st.button("💾 송장등록 설정 저장", use_container_width=True, key="invoice_save_settings_btn"):
-            inv_save_settings(
-                {
-                    "tracking_password": tracking_password_input.strip(),
-                    "courier_nextmile": inv_normalize_courier_output_setting(
-                        courier_nextmile_input,
-                        INV_COURIER_NEXTMILE_DEFAULT,
-                    ),
-                    "courier_lotte": inv_normalize_courier_output_setting(
-                        courier_lotte_input,
-                        INV_COURIER_LOTTE_DEFAULT,
-                    ),
-                }
+        with st.expander("송장등록 옵션", expanded=False):
+            st.subheader("운송장 비밀번호 설정")
+            tracking_password_input = st.text_input(
+                "운송장/출고 엑셀 비밀번호",
+                value=str(inv_settings.get("tracking_password", INV_TRACKING_PASSWORD_DEFAULT)),
+                type="password",
+                key="invoice_tracking_password_setting",
+                help="이 비밀번호로 2번 운송장/출고 엑셀을 자동으로 엽니다.",
             )
-            st.success("송장등록 설정 저장 완료")
+
+            st.subheader("운송장 배송사 출력 설정")
+            st.caption("운송장/출고 엑셀의 배송사 값이 넥스트마일 또는 롯데일 때, 결과 엑셀의 택배사명을 아래 값으로 바꿔 넣습니다.")
+            courier_nextmile_input = st.text_input(
+                "넥스트마일 → 결과 택배사",
+                value=str(inv_settings.get("courier_nextmile", INV_COURIER_NEXTMILE_DEFAULT)),
+                key="invoice_courier_nextmile_setting",
+            )
+            courier_lotte_input = st.text_input(
+                "롯데 → 결과 택배사",
+                value=str(inv_settings.get("courier_lotte", INV_COURIER_LOTTE_DEFAULT)),
+                key="invoice_courier_lotte_setting",
+            )
+
+            if st.button("💾 송장등록 설정 저장", use_container_width=True, key="invoice_save_settings_btn"):
+                inv_save_settings(
+                    {
+                        "tracking_password": tracking_password_input.strip(),
+                        "courier_nextmile": inv_normalize_courier_output_setting(
+                            courier_nextmile_input,
+                            INV_COURIER_NEXTMILE_DEFAULT,
+                        ),
+                        "courier_lotte": inv_normalize_courier_output_setting(
+                            courier_lotte_input,
+                            INV_COURIER_LOTTE_DEFAULT,
+                        ),
+                    }
+                )
+                st.success("송장등록 설정 저장 완료")
 
     courier_nextmile_input = inv_normalize_courier_output_setting(
         courier_nextmile_input,
@@ -565,7 +587,7 @@ def render_invoice_register_page():
         return
 
     try:
-        out_df, dup_info, skipped_cancelled = inv_build_output(
+        out_df, dup_info, skipped_cancelled, result_excluded_cancelled = inv_build_output(
             df1,
             df2,
             courier_nextmile=courier_nextmile_input,
@@ -579,7 +601,7 @@ def render_invoice_register_page():
     c_meta1, c_meta2, c_meta3 = st.columns(3)
     c_meta1.caption(f"스마트스토어 헤더 행: {smartstore_header_idx + 1}행")
     c_meta2.caption(f"운송장 파일 헤더 행: {tracking_header_idx + 1}행")
-    c_meta3.caption(f"배송 취소 제외: {skipped_cancelled}건")
+    c_meta3.caption(f"배송 취소 행 제외: {skipped_cancelled}건 / 결과 제외: {result_excluded_cancelled}건")
 
     with st.expander("미리보기 (상위 30건)", expanded=False):
         st.dataframe(out_df.head(30), use_container_width=True)
