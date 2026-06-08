@@ -99,8 +99,8 @@ TC_SETTINGS_PATH = DATA_DIR / "tc_settings.json"
 # ✅ 스티커 제외 설정 저장 파일 (프로그램 껐다 켜도 유지)
 STICKER_SETTINGS_PATH = DATA_DIR / "sticker_settings.json"
 
-# ✅ 레포(앱 폴더)에 "TC주문_등록양식.xlsx" 파일을 같이 올려두면 업로드 없이 자동 사용
-TC_TEMPLATE_DEFAULT_PATH = Path("TC주문_등록양식.xlsx")
+# ✅ 레포(앱 폴더)에 "컬리주문_등록양식.xlsx" 파일을 같이 올려두면 업로드 없이 자동 사용
+TC_TEMPLATE_DEFAULT_PATH = Path("컬리주문_등록양식.xlsx")
 
 # ✅ SmartStore 엑셀 비번
 EXCEL_PASSWORD = "0000"

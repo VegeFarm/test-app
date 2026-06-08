@@ -15,6 +15,7 @@ from typing import Optional, Tuple, List, Dict
 import pandas as pd
 import streamlit as st
 import openpyxl
+from openpyxl.styles import Font
 import requests
 
 # Google Drive upload (optional)
@@ -453,9 +454,12 @@ def _as_int_qty(v) -> int:
 
 # -------------------- TC defaults --------------------
 TC_PRODUCT_NAME_FIXED = "채소팜상품"
-TC_ACCESS_FALLBACK = "경비실 호출"
-TC_TYPE_DAWN_DEFAULT = "자동"
-TC_TYPE_NEXT_DEFAULT = "택배대행"
+# 신규 배송대행 업로드 양식 고정값
+TC_RECEIVE_PLACE_FIXED = "문 앞"
+TC_ENTRY_METHOD_FIXED = "경비실 호출"
+TC_TYPE_DAWN_DEFAULT = "샛별배송"
+TC_TYPE_NEXT_DEFAULT = "하루배송"
+TC_TYPE_ALLOWED_NEW = {"샛별배송", "하루배송", "자동"}
 
 # 수취인별 PDF 스타일
 RECIPIENT_FONT_SIZE = 12
@@ -505,8 +509,46 @@ STICKER_TEXT_SHIFT_BOTTOM_ROWS_MM = 3.5
 
 
 def _clean_access_message(msg: str) -> str:
+    """배송메세지를 신규 양식의 '출입방법 상세설명'에 넣기 위한 정리 함수."""
     s = str(msg or "").strip()
-    return s if s else TC_ACCESS_FALLBACK
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s
+
+
+def _limit_tc_name_20(value) -> str:
+    """TC 신규 양식의 주문자/수령자 이름 제한: 띄어쓰기 포함 최대 20자."""
+    s = str(value or "").strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s[:20]
+
+
+def _sanitize_tc_delivery_type(value: str, ship: str = "") -> str:
+    """신규 배송대행 양식의 배송유형 드롭다운 값으로 보정합니다."""
+    default = TC_TYPE_DAWN_DEFAULT if ship == "새벽배송" else TC_TYPE_NEXT_DEFAULT
+    s = normalize_text(value)
+    if s in TC_TYPE_ALLOWED_NEW:
+        return s
+    # 예전 템플릿에서 쓰던 값(예: 택배대행)은 신규 양식에 맞게 자동 보정
+    return default
+
+
+def split_road_address(full_address: str) -> Tuple[str, str]:
+    """네이버 통합배송지를 신규 양식의 도로명 기본주소/상세주소로 분리합니다."""
+    s = str(full_address or "").strip()
+    if not s or s.lower() in ("nan", "none"):
+        return "", ""
+    s = re.sub(r"\s+", " ", s)
+
+    # 도로명 주소의 건물번호까지를 기본주소로 인식합니다.
+    # 예: 서울 ... 백제고분로39길 30 (석촌동) 102호 -> 기본주소 / 상세주소
+    m = re.match(r"^(.+(?:대로|로|길)\s*\d+(?:-\d+)?)(?:\s+(.*))?$", s)
+    if m:
+        base = (m.group(1) or "").strip()
+        detail = (m.group(2) or "").strip()
+        return base, detail
+    return s, ""
 
 
 # -------------------- ✅ TC Settings (persist) --------------------
@@ -518,16 +560,16 @@ def load_tc_settings() -> Dict[str, str]:
         data = json.loads(TC_SETTINGS_PATH.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return default
-        dawn = normalize_text(data.get("dawn", "")) or TC_TYPE_DAWN_DEFAULT
-        nxt = normalize_text(data.get("next", "")) or TC_TYPE_NEXT_DEFAULT
+        dawn = _sanitize_tc_delivery_type(data.get("dawn", ""), "새벽배송")
+        nxt = _sanitize_tc_delivery_type(data.get("next", ""), "익일배송")
         return {"dawn": dawn, "next": nxt}
     except Exception:
         return default
 
 
 def save_tc_settings(dawn: str, nxt: str) -> None:
-    dawn = normalize_text(dawn) or TC_TYPE_DAWN_DEFAULT
-    nxt = normalize_text(nxt) or TC_TYPE_NEXT_DEFAULT
+    dawn = _sanitize_tc_delivery_type(dawn, "새벽배송")
+    nxt = _sanitize_tc_delivery_type(nxt, "익일배송")
     _atomic_write_text(
         TC_SETTINGS_PATH,
         json.dumps({"dawn": dawn, "next": nxt}, ensure_ascii=False, indent=2),
@@ -1591,6 +1633,8 @@ def build_sticker_pdf(label_texts: List[str]) -> bytes:
 # -------------------- TC 주문_등록양식 자동 채우기 --------------------
 def _norm_header(s: str) -> str:
     s = str(s or "")
+    # 신규 양식 헤더의 '(최대 500자)', '(드롭다운 선택)' 같은 안내문 제거
+    s = re.sub(r"\([^)]*\)", "", s)
     s = s.replace("*", "")
     s = re.sub(r"\s+", "", s)
     return s.strip().lower()
@@ -1598,45 +1642,103 @@ def _norm_header(s: str) -> str:
 
 def build_tc_excel_bytes(template_bytes: bytes, rows: List[Dict[str, str]]) -> bytes:
     wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
-    if "양식" not in wb.sheetnames:
-        raise ValueError("TC 템플릿에 '양식' 시트가 없습니다.")
-    ws = wb["양식"]
+
+    # 신규 템플릿 우선, 기존 템플릿도 호환
+    if "엑셀 업로드 양식" in wb.sheetnames:
+        ws = wb["엑셀 업로드 양식"]
+    elif "양식" in wb.sheetnames:
+        ws = wb["양식"]
+    else:
+        raise ValueError("TC 템플릿에 '엑셀 업로드 양식' 또는 '양식' 시트가 없습니다.")
 
     headers = {}
+    header_items = []
     for col in range(1, ws.max_column + 1):
         v = ws.cell(1, col).value
         if v is None:
             continue
-        headers[_norm_header(v)] = col
+        key = _norm_header(v)
+        if not key:
+            continue
+        headers[key] = col
+        header_items.append((key, col, str(v)))
 
-    def col_of(label_candidates: List[str]) -> int:
+    def col_of(label_candidates: List[str], required: bool = True) -> Optional[int]:
         for cand in label_candidates:
             key = _norm_header(cand)
+            if not key:
+                continue
             if key in headers:
                 return headers[key]
-        raise KeyError(f"필수 헤더를 찾지 못했습니다: {label_candidates}")
+            for hkey, hcol, _raw in header_items:
+                if key == hkey or hkey.startswith(key) or key in hkey or hkey in key:
+                    return hcol
+        if required:
+            raise KeyError(
+                f"필수 헤더를 찾지 못했습니다: {label_candidates} / 현재 헤더: {[x[2] for x in header_items]}"
+            )
+        return None
 
-    c_req = col_of(["배송요청일", "배송요청일*"])
-    c_orderer = col_of(["주문자", "주문자*"])
-    c_receiver = col_of(["수령자", "수령자*"])
-    c_addr = col_of(["수령자도로명주소", "수령자 도로명 주소", "수령자 도로명 주소*"])
-    c_phone = col_of(["수령자연락처", "수령자 연락처", "수령자 연락처*"])
-    c_in = col_of(["출입방법", "출입 방법"])
-    c_prod = col_of(["상품명", "상품명*"])
-    c_type = col_of(["배송유형", "배송 유형", "배송 유형*"])
+    c_order_no = col_of(["판매처 주문번호", "판매처주문번호", "주문번호", "주문 번호"], required=False)
+    c_req = col_of(["배송예정일", "배송 요청일", "배송요청일", "배송요청일*"], required=True)
+    c_type = col_of(["배송유형", "배송 유형", "배송 유형*"], required=True)
+    c_orderer = col_of(["주문자이름", "주문자 이름", "주문자", "주문자*"], required=True)
+    c_receiver = col_of(["수령자이름", "수령자 이름", "수령자", "수령자*", "수취인명"], required=True)
+    c_phone = col_of(["수령자 연락처", "수령자연락처", "수취인연락처", "수취인 연락처", "수령자 연락처*"], required=True)
+    c_prod = col_of(["상품명", "상품명*"], required=True)
+
+    c_addr_base = col_of(["도로명 기본주소", "도로명기본주소", "수령자도로명주소", "수령자 도로명 주소", "수령자 도로명 주소*"], required=False)
+    c_addr_detail = col_of(["상세 주소", "상세주소", "상세주소*"], required=False)
+    if c_addr_base is None:
+        raise KeyError("필수 헤더를 찾지 못했습니다: 도로명 기본주소/수령자 도로명 주소")
+
+    c_receive_place = col_of(["상품수령장소", "상품 수령 장소", "배송받을장소", "배송 받을 장소"], required=False)
+    c_receive_place_detail = col_of(["상품수령장소 상세설명", "상품 수령 장소 상세설명", "배송받을장소 상세설명"], required=False)
+    c_entry_method = col_of(["출입방법", "출입 방법"], required=False)
+    c_entry_detail = col_of(["출입방법 상세설명", "출입 방법 상세설명"], required=False)
+
+    # 기존 값 제거(스타일/드롭다운은 보존)
+    clear_to = max(ws.max_row, len(rows) + 1)
+    for rr in range(2, clear_to + 1):
+        for cc in range(1, ws.max_column + 1):
+            ws.cell(rr, cc).value = None
+
+    def put(rr: int, cc: Optional[int], value) -> None:
+        if cc is not None:
+            ws.cell(rr, cc).value = "" if value is None else value
 
     start_row = 2
     for i, r in enumerate(rows):
         rr = start_row + i
-        ws.cell(rr, c_req).value = r.get("배송요청일", "")
-        ws.cell(rr, c_orderer).value = r.get("주문자", "")
-        ws.cell(rr, c_receiver).value = r.get("수령자", "")
-        ws.cell(rr, c_addr).value = r.get("수령자도로명주소", "")
-        ws.cell(rr, c_phone).value = r.get("수령자연락처", "")
-        ws.cell(rr, c_in).value = r.get("출입방법", "")
-        ws.cell(rr, c_prod).value = r.get("상품명", "")
-        ws.cell(rr, c_type).value = r.get("배송유형", "")
-        # 배송받을장소는 건드리지 않음
+        req_day = r.get("배송예정일", r.get("배송요청일", ""))
+        full_addr = str(r.get("수령자도로명주소", "") or "").strip()
+        base_addr = str(r.get("도로명기본주소", "") or "").strip()
+        detail_addr = str(r.get("상세주소", "") or "").strip()
+
+        # 2026-06 신규 TC 양식 요청사항
+        # - 판매처 주문번호는 입력하지 않음
+        # - 상세주소를 따로 분리하지 않고 전체 주소를 도로명 기본주소에 입력
+        if not full_addr:
+            full_addr = " ".join([x for x in [base_addr, detail_addr] if x]).strip()
+
+        put(rr, c_order_no, "")
+        put(rr, c_prod, r.get("상품명", ""))
+        put(rr, c_req, req_day)
+        put(rr, c_type, _sanitize_tc_delivery_type(r.get("배송유형", ""), r.get("그룹배송구분", "")))
+        put(rr, c_orderer, _limit_tc_name_20(r.get("주문자", "")))
+        put(rr, c_receiver, _limit_tc_name_20(r.get("수령자", "")))
+        put(rr, c_phone, r.get("수령자연락처", ""))
+        put(rr, c_addr_base, full_addr or base_addr)
+        put(rr, c_addr_detail, "")
+        put(rr, c_receive_place, TC_RECEIVE_PLACE_FIXED)
+        put(rr, c_receive_place_detail, "")
+        put(rr, c_entry_method, TC_ENTRY_METHOD_FIXED)
+        put(rr, c_entry_detail, r.get("출입방법상세설명", r.get("배송메세지", "")))
+
+        # 템플릿 2행 B/C 열에 남아 있던 작은 글씨 스타일(Arial 10 등)을 방지하고,
+        # 실제 업로드 데이터 행의 글자 크기를 통일합니다. 날짜/드롭다운/서식은 유지됩니다.
+        for cc in range(1, ws.max_column + 1):
+            ws.cell(rr, cc).font = Font(name="맑은 고딕", size=11)
 
     out = io.BytesIO()
     wb.save(out)
@@ -2395,7 +2497,7 @@ def render_mapping_rules_page():
 
 def render_excel_results_page():
     st.title("📥 엑셀 업로드")
-    st.caption("엑셀 업로드 → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF + TC주문_등록양식 자동작성")
+    st.caption("엑셀 업로드 → 제품별 집계 + 수취인별 PDF + 스티커용지 PDF + 컬리주문_등록양식 자동작성")
     st.markdown("---")
 
     if msoffcrypto is None:
@@ -2425,8 +2527,8 @@ def render_excel_results_page():
         )
 
         if st.button("💾 TC 설정 저장", use_container_width=True, key="save_tc_settings_btn"):
-            dawn_val = (dawn_val or "").strip() or TC_TYPE_DAWN_DEFAULT
-            next_val = (next_val or "").strip() or TC_TYPE_NEXT_DEFAULT
+            dawn_val = _sanitize_tc_delivery_type(dawn_val, "새벽배송")
+            next_val = _sanitize_tc_delivery_type(next_val, "익일배송")
 
             st.session_state.tc_type_dawn = dawn_val
             st.session_state.tc_type_next = next_val
@@ -2490,6 +2592,7 @@ def render_excel_results_page():
     col_opt = find_col(raw_df, ["옵션정보", "옵션", "선택옵션"])
     col_recv_phone = find_col(raw_df, ["수취인연락처", "수령인연락처", "수취인 연락처", "수령인 연락처", "전화번호", "연락처"])
     col_msg = find_col(raw_df, ["배송메세지", "배송메시지", "배송 메시지", "배송 메세지", "배송요청사항", "요청사항"])
+    col_order_no = find_col(raw_df, ["주문번호", "판매처 주문번호", "판매처주문번호", "상품주문번호", "상품 주문번호"])
 
     missing = [k for k, v in {
         "상품명": col_name,
@@ -2513,6 +2616,10 @@ def render_excel_results_page():
 
     work = raw_df[[col_buyer, col_recv, col_addr, col_recv_phone, col_msg, col_opt, col_name, col_qty]].copy()
     work.columns = ["구매자명", "수취인명", "통합배송지", "수취인연락처", "배송메세지", "옵션정보", "상품명", "수량"]
+    if col_order_no is not None:
+        work["주문번호"] = raw_df[col_order_no].astype(str).replace({"nan": "", "None": ""})
+    else:
+        work["주문번호"] = ""
 
     work["상품명"] = work["상품명"].astype(str)
     work["수량"] = pd.to_numeric(work["수량"], errors="coerce")
@@ -2742,12 +2849,12 @@ def render_excel_results_page():
             use_container_width=True,
         )
 
-    # TC 주문 등록
+    # 컬리 주문 등록
     st.markdown("---")
-    st.subheader("🧾 TC주문_등록양식 ( 새벽 / 익일 )")
+    st.subheader("🧾 컬리주문_등록양식 ( 새벽 / 익일 )")
 
     if not TC_TEMPLATE_DEFAULT_PATH.exists():
-        st.error("앱 폴더에 'TC주문_등록양식.xlsx' 파일이 없습니다. GitHub에 app.py와 같이 올려주세요.")
+        st.error("앱 폴더에 '컬리주문_등록양식.xlsx' 파일이 없습니다. GitHub에 app.py와 같이 올려주세요.")
     else:
         template_bytes = TC_TEMPLATE_DEFAULT_PATH.read_bytes()
 
@@ -2769,6 +2876,7 @@ def render_excel_results_page():
                 그룹배송구분=("그룹배송구분", "first"),
                 수취인연락처=("수취인연락처", _first_nonempty),
                 배송메세지=("배송메세지", _first_nonempty),
+                주문번호=("주문번호", _first_nonempty),
                 구매자명=("구매자명", "first"),
                 수취인명=("수취인명", "first"),
                 통합배송지=("통합배송지", "first"),
@@ -2779,19 +2887,29 @@ def render_excel_results_page():
         def make_tc_rows(df: pd.DataFrame, ship: str) -> List[Dict[str, str]]:
             out = []
             ship_type = st.session_state.tc_type_dawn if ship == "새벽배송" else st.session_state.tc_type_next
-            ship_type = (ship_type or "").strip() or (TC_TYPE_DAWN_DEFAULT if ship == "새벽배송" else TC_TYPE_NEXT_DEFAULT)
+            ship_type = _sanitize_tc_delivery_type(ship_type, ship)
 
             for _, r in df.iterrows():
+                full_addr = str(r["통합배송지"] or "").strip()
                 out.append(
                     {
-                        "배송요청일": req_day_str,
-                        "주문자": str(r["구매자명"] or "").strip(),
-                        "수령자": str(r["수취인명"] or "").strip(),
-                        "수령자도로명주소": str(r["통합배송지"] or "").strip(),
+                        "판매처주문번호": "",
+                        "배송예정일": req_day_str,
+                        "배송요청일": req_day_str,  # 기존 양식 호환
+                        "주문자": _limit_tc_name_20(r["구매자명"]),
+                        "수령자": _limit_tc_name_20(r["수취인명"]),
+                        "수령자도로명주소": full_addr,
+                        "도로명기본주소": full_addr,
+                        "상세주소": "",
                         "수령자연락처": str(r.get("수취인연락처", "") or "").strip(),
-                        "출입방법": _clean_access_message(r.get("배송메세지", "")),
+                        "상품수령장소": TC_RECEIVE_PLACE_FIXED,
+                        "상품수령장소상세설명": "",
+                        "출입방법": TC_ENTRY_METHOD_FIXED,
+                        "출입방법상세설명": _clean_access_message(r.get("배송메세지", "")),
+                        "배송메세지": _clean_access_message(r.get("배송메세지", "")),
                         "상품명": TC_PRODUCT_NAME_FIXED,
                         "배송유형": ship_type,
+                        "그룹배송구분": ship,
                     }
                 )
             return out
@@ -2805,9 +2923,9 @@ def render_excel_results_page():
             if len(dawn_df):
                 out_bytes = build_tc_excel_bytes(template_bytes, make_tc_rows(dawn_df, "새벽배송"))
                 st.download_button(
-                    "⬇️ TC주문_등록양식(새벽배송) 엑셀 다운로드",
+                    "⬇️ 컬리주문_등록양식(새벽배송) 엑셀 다운로드",
                     data=out_bytes,
-                    file_name="새벽배송_송장.xlsx",
+                    file_name="컬리주문_등록양식_새벽배송.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
@@ -2817,9 +2935,9 @@ def render_excel_results_page():
             if len(next_df):
                 out_bytes = build_tc_excel_bytes(template_bytes, make_tc_rows(next_df, "익일배송"))
                 st.download_button(
-                    "⬇️ TC주문_등록양식(익일배송) 엑셀 다운로드",
+                    "⬇️ 컬리주문_등록양식(익일배송) 엑셀 다운로드",
                     data=out_bytes,
-                    file_name="익일배송_송장.xlsx",
+                    file_name="컬리주문_등록양식_익일배송.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
