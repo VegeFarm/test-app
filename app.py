@@ -2925,7 +2925,7 @@ def render_excel_results_page():
                 st.download_button(
                     "⬇️ 컬리주문_등록양식(새벽배송) 엑셀 다운로드",
                     data=out_bytes,
-                    file_name="컬리주문_등록양식_새벽배송.xlsx",
+                    file_name="새벽배송_송장.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
@@ -2937,7 +2937,7 @@ def render_excel_results_page():
                 st.download_button(
                     "⬇️ 컬리주문_등록양식(익일배송) 엑셀 다운로드",
                     data=out_bytes,
-                    file_name="컬리주문_등록양식_익일배송.xlsx",
+                    file_name="익일배송_송장.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
