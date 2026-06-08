@@ -5,14 +5,26 @@ except ModuleNotFoundError:
 
 def render_invoice_register_page():
     import io
+    import json
     import re
     from decimal import Decimal, InvalidOperation
+    from pathlib import Path
     from typing import Optional, Tuple, Dict
 
     import pandas as pd
     import streamlit as st
 
     INV_FIXED_PASSWORD = "0000"
+    INV_TRACKING_PASSWORD_DEFAULT = "CU000640-master"
+    INV_COURIER_NEXTMILE_DEFAULT = "컬리넥스트마일"
+    INV_COURIER_LOTTE_DEFAULT = "롯데택배"
+
+    try:
+        from config import DATA_DIR
+        INV_SETTINGS_PATH = DATA_DIR / "invoice_settings.json"
+    except Exception:
+        INV_SETTINGS_PATH = Path("invoice_settings.json")
+
     INV_ROMAN_MAP = str.maketrans({
         "Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
         "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10",
@@ -21,7 +33,9 @@ def render_invoice_register_page():
     })
 
     INV_SMARTSTORE_REQUIRED = ("구매자명", "수취인명", "통합배송지", "상품주문번호")
-    INV_TRACKING_REQUIRED = ("주문자", "수령자", "수령자주소(상세포함)", "운송장번호")
+    # 새 운송장/출고 엑셀은 "주문자 이름", "수령자 이름", "운송장 번호"처럼
+    # 띄어쓰기/설명 문구가 달라질 수 있어 헤더 탐색은 핵심 컬럼만 사용합니다.
+    INV_TRACKING_REQUIRED = ("운송장번호", "수령자주소(상세포함)")
 
     def inv_norm_text(s) -> str:
         if s is None or (isinstance(s, float) and pd.isna(s)):
@@ -87,6 +101,32 @@ def render_invoice_register_page():
         if "-" in s:
             return s
         return inv_to_plain_number_str(s)
+
+    def inv_load_settings() -> dict:
+        default = {
+            "tracking_password": INV_TRACKING_PASSWORD_DEFAULT,
+            "courier_nextmile": INV_COURIER_NEXTMILE_DEFAULT,
+            "courier_lotte": INV_COURIER_LOTTE_DEFAULT,
+        }
+        try:
+            if INV_SETTINGS_PATH.exists():
+                data = json.loads(INV_SETTINGS_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    default.update({k: str(v) for k, v in data.items() if v is not None})
+        except Exception:
+            pass
+        return default
+
+    def inv_save_settings(data: dict) -> None:
+        try:
+            INV_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INV_SETTINGS_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            # 설정 저장 실패가 송장 처리 자체를 막지 않도록 합니다.
+            pass
 
     def inv_decrypt_office_excel(file_bytes: bytes, password: str) -> io.BytesIO:
         if msoffcrypto is None:
@@ -172,6 +212,59 @@ def render_invoice_register_page():
 
         return df, header_idx
 
+    def inv_get_column(df: pd.DataFrame, candidates, required: bool = True) -> Optional[str]:
+        """정규화된 컬럼명에서 후보 컬럼을 찾습니다.
+
+        예: 새 엑셀의 "주문자 이름"은 inv_clean_header_text 후 "주문자이름"이 됩니다.
+        """
+        cols = list(df.columns)
+        cand_clean = [inv_clean_header_text(c) for c in candidates]
+
+        for cand in cand_clean:
+            if cand in cols:
+                return cand
+
+        for cand in cand_clean:
+            for col in cols:
+                if cand and cand in col:
+                    return col
+
+        if required:
+            raise ValueError(f"필요한 컬럼을 찾지 못했습니다: {', '.join(candidates)}")
+        return None
+
+    def inv_first_nonempty(series: pd.Series) -> str:
+        for v in series.tolist():
+            if v is None:
+                continue
+            try:
+                if isinstance(v, float) and pd.isna(v):
+                    continue
+            except Exception:
+                pass
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return s
+        return ""
+
+    def inv_resolve_courier(raw_courier, tracking_no: str, courier_nextmile: str, courier_lotte: str) -> str:
+        tracking_no = "" if tracking_no is None else str(tracking_no).strip()
+        if not tracking_no:
+            return ""
+
+        raw = "" if raw_courier is None else str(raw_courier).strip()
+        raw_norm = inv_clean_header_text(raw).lower()
+
+        if "넥스트" in raw_norm or "nextmile" in raw_norm:
+            return courier_nextmile
+        if "롯데" in raw_norm or "lotte" in raw_norm:
+            return courier_lotte
+        if raw:
+            return raw
+
+        # 구형 운송장 파일처럼 배송사 컬럼이 없을 때는 기존 방식 유지
+        return courier_nextmile if "-" in tracking_no else courier_lotte
+
     def inv_choose_tracking(series: pd.Series) -> Optional[str]:
         s = series.dropna().astype(str)
         if s.empty:
@@ -186,19 +279,33 @@ def render_invoice_register_page():
                 return v
         return candidates[0]
 
-    def inv_build_output(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def inv_build_output(
+        df1: pd.DataFrame,
+        df2: pd.DataFrame,
+        courier_nextmile: str,
+        courier_lotte: str,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
         col_buyer = "구매자명"
         col_recv = "수취인명"
         col_addr = "통합배송지"
         col_po = "상품주문번호"
 
-        col2_buyer = "주문자"
-        col2_recv = "수령자"
-        col2_addr = "수령자주소(상세포함)"
-        col2_track = "운송장번호"
+        # 운송장/출고 엑셀은 구형/신형 컬럼명을 모두 허용합니다.
+        col2_buyer = inv_get_column(df2, ["주문자이름", "주문자명", "주문자"])
+        col2_recv = inv_get_column(df2, ["수령자이름", "수취인이름", "수령자", "수취인명"])
+        col2_addr = inv_get_column(df2, ["수령자주소(상세포함)", "수취인주소(상세포함)", "통합배송지"])
+        col2_track = inv_get_column(df2, ["운송장번호", "송장번호"])
+        col2_status = inv_get_column(df2, ["운송장상태", "출고상태", "상태"], required=False)
+        col2_courier = inv_get_column(df2, ["배송사", "택배사", "운송사"], required=False)
 
         df1 = df1.copy()
         df2 = df2.copy()
+
+        skipped_cancelled = 0
+        if col2_status:
+            cancel_mask = df2[col2_status].map(inv_clean_header_text) == "배송취소"
+            skipped_cancelled = int(cancel_mask.sum())
+            df2 = df2.loc[~cancel_mask].reset_index(drop=True)
 
         df1["__key"] = (
             df1[col_buyer].map(inv_norm_text)
@@ -214,12 +321,25 @@ def render_invoice_register_page():
             + "|"
             + df2[col2_addr].map(inv_norm_text)
         )
+        df2["__송장번호_plain"] = df2[col2_track].apply(inv_to_plain_tracking_str)
+        df2 = df2.loc[df2["__송장번호_plain"].astype(str).str.strip() != ""].reset_index(drop=True)
 
-        map_track: Dict[str, Optional[str]] = df2.groupby("__key")[col2_track].apply(inv_choose_tracking).to_dict()
-        df1["송장번호"] = df1["__key"].map(map_track)
+        track_records: Dict[str, Dict[str, str]] = {}
+        for key, group in df2.groupby("__key", dropna=False):
+            tracking = inv_choose_tracking(group["__송장번호_plain"])
+            courier_raw = ""
+            if col2_courier:
+                same_tracking = group[group["__송장번호_plain"].astype(str) == str(tracking)]
+                courier_raw = inv_first_nonempty(same_tracking[col2_courier])
+                if not courier_raw:
+                    courier_raw = inv_first_nonempty(group[col2_courier])
+            track_records[key] = {"tracking": tracking or "", "courier_raw": courier_raw}
+
+        df1["송장번호"] = df1["__key"].map(lambda k: track_records.get(k, {}).get("tracking", ""))
+        df1["__배송사_raw"] = df1["__key"].map(lambda k: track_records.get(k, {}).get("courier_raw", ""))
 
         dup_info = (
-            df2.groupby("__key")[col2_track]
+            df2.groupby("__key")["__송장번호_plain"]
             .nunique(dropna=True)
             .reset_index(name="운송장번호_종류수")
             .query("운송장번호_종류수 > 1")
@@ -233,13 +353,48 @@ def render_invoice_register_page():
             {
                 "상품주문번호": df1["_상품주문번호_plain"],
                 "배송방법": ["택배,등기,소포"] * len(df1),
-                "택배사": df1["_송장번호_plain"].apply(
-                    lambda x: "컬리넥스트마일" if "-" in str(x) else ("롯데택배" if str(x).strip() else "")
+                "택배사": df1.apply(
+                    lambda row: inv_resolve_courier(
+                        row.get("__배송사_raw", ""),
+                        row.get("_송장번호_plain", ""),
+                        courier_nextmile,
+                        courier_lotte,
+                    ),
+                    axis=1,
                 ),
                 "송장번호": df1["_송장번호_plain"],
             }
         )
-        return out, dup_info
+        return out, dup_info, skipped_cancelled
+
+    def inv_read_tracking_file(excel_source, password: str) -> Tuple[pd.DataFrame, int]:
+        errors = []
+        password = (password or "").strip()
+
+        if password:
+            try:
+                excel_source.seek(0)
+                return inv_read_excel_with_flexible_header(
+                    excel_source,
+                    required_columns=INV_TRACKING_REQUIRED,
+                    password=password,
+                    max_scan=50,
+                )
+            except Exception as e:
+                errors.append(f"비밀번호 적용 읽기 실패: {e}")
+
+        try:
+            excel_source.seek(0)
+            return inv_read_excel_with_flexible_header(
+                excel_source,
+                required_columns=INV_TRACKING_REQUIRED,
+                password=None,
+                max_scan=50,
+            )
+        except Exception as e:
+            errors.append(f"일반 읽기 실패: {e}")
+
+        raise ValueError(" / ".join(errors))
 
     def inv_export_xls(out_df: pd.DataFrame) -> bytes:
         import xlwt
@@ -276,6 +431,8 @@ def render_invoice_register_page():
 
     st.markdown("- 1번 파일은 **비밀번호 0000 고정**으로 열어서 처리합니다.")
     st.markdown("- 스마트스토어 엑셀은 **1행에 안내문/메모가 있어도 자동으로 실제 헤더를 찾아 처리**합니다.")
+    st.markdown("- 2번 운송장/출고 엑셀은 왼쪽 **운송장 비밀번호 설정**에 저장된 비밀번호로 자동 복호화합니다.")
+    st.markdown("- 운송장 상태가 **배송 취소**인 행은 송장 매칭에서 자동 제외합니다.")
     st.markdown("- 결과는 **xls** 형식으로 다운로드됩니다.")
 
     st.markdown(
@@ -287,6 +444,44 @@ def render_invoice_register_page():
 """,
         unsafe_allow_html=True,
     )
+
+    inv_settings = inv_load_settings()
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("운송장 비밀번호 설정")
+        tracking_password_input = st.text_input(
+            "운송장/출고 엑셀 비밀번호",
+            value=str(inv_settings.get("tracking_password", INV_TRACKING_PASSWORD_DEFAULT)),
+            type="password",
+            key="invoice_tracking_password_setting",
+            help="이 비밀번호로 2번 운송장/출고 엑셀을 자동으로 엽니다.",
+        )
+
+        st.subheader("운송장 배송사 출력 설정")
+        st.caption("운송장/출고 엑셀의 배송사 값이 넥스트마일 또는 롯데일 때, 결과 엑셀의 택배사명을 아래 값으로 바꿔 넣습니다.")
+        courier_nextmile_input = st.text_input(
+            "넥스트마일 → 결과 택배사",
+            value=str(inv_settings.get("courier_nextmile", INV_COURIER_NEXTMILE_DEFAULT)),
+            key="invoice_courier_nextmile_setting",
+        )
+        courier_lotte_input = st.text_input(
+            "롯데 → 결과 택배사",
+            value=str(inv_settings.get("courier_lotte", INV_COURIER_LOTTE_DEFAULT)),
+            key="invoice_courier_lotte_setting",
+        )
+
+        if st.button("💾 송장등록 설정 저장", use_container_width=True, key="invoice_save_settings_btn"):
+            inv_save_settings(
+                {
+                    "tracking_password": tracking_password_input.strip(),
+                    "courier_nextmile": courier_nextmile_input.strip() or INV_COURIER_NEXTMILE_DEFAULT,
+                    "courier_lotte": courier_lotte_input.strip() or INV_COURIER_LOTTE_DEFAULT,
+                }
+            )
+            st.success("송장등록 설정 저장 완료")
+
+    courier_nextmile_input = courier_nextmile_input.strip() or INV_COURIER_NEXTMILE_DEFAULT
+    courier_lotte_input = courier_lotte_input.strip() or INV_COURIER_LOTTE_DEFAULT
 
     st.markdown('<div class="upload-title">1) 스마트스토어 엑셀(비번0000)</div>', unsafe_allow_html=True)
     f1 = st.file_uploader(
@@ -326,38 +521,34 @@ def render_invoice_register_page():
         return
 
     try:
-        df2, tracking_header_idx = inv_read_excel_with_flexible_header(
-            f2,
-            required_columns=INV_TRACKING_REQUIRED,
-            password=None,
-            max_scan=30,
-        )
-    except Exception:
-        try:
-            f2.seek(0)
-            df2 = pd.read_excel(f2, dtype=object)
-            df2 = inv_normalize_columns(df2)
-            tracking_header_idx = 0
-        except Exception as e:
-            st.error("2번 파일을 읽지 못했습니다.")
-            st.exception(e)
-            return
+        df2, tracking_header_idx = inv_read_tracking_file(f2, tracking_password_input)
+    except Exception as e:
+        st.error("2번 운송장/출고 엑셀을 읽지 못했습니다. 왼쪽의 운송장 비밀번호 설정 값을 확인해 주세요.")
+        st.exception(e)
+        return
 
     need1 = set(INV_SMARTSTORE_REQUIRED)
-    need2 = {"주문자", "수령자", "수령자주소(상세포함)", "운송장번호"}
 
     if not need1.issubset(set(df1.columns)):
         st.error(f"1번 파일에 필요한 컬럼이 없습니다: {sorted(list(need1 - set(df1.columns)))}")
         return
-    if not need2.issubset(set(df2.columns)):
-        st.error(f"2번 파일에 필요한 컬럼이 없습니다: {sorted(list(need2 - set(df2.columns)))}")
+
+    try:
+        out_df, dup_info, skipped_cancelled = inv_build_output(
+            df1,
+            df2,
+            courier_nextmile=courier_nextmile_input,
+            courier_lotte=courier_lotte_input,
+        )
+    except Exception as e:
+        st.error("2번 운송장/출고 엑셀의 필수 컬럼을 찾지 못했거나 송장 매칭 중 오류가 발생했습니다.")
+        st.exception(e)
         return
 
-    out_df, dup_info = inv_build_output(df1, df2)
-
-    c_meta1, c_meta2 = st.columns(2)
+    c_meta1, c_meta2, c_meta3 = st.columns(3)
     c_meta1.caption(f"스마트스토어 헤더 행: {smartstore_header_idx + 1}행")
     c_meta2.caption(f"운송장 파일 헤더 행: {tracking_header_idx + 1}행")
+    c_meta3.caption(f"배송 취소 제외: {skipped_cancelled}건")
 
     with st.expander("미리보기 (상위 30건)", expanded=False):
         st.dataframe(out_df.head(30), use_container_width=True)
