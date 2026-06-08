@@ -128,6 +128,25 @@ def render_invoice_register_page():
             # 설정 저장 실패가 송장 처리 자체를 막지 않도록 합니다.
             pass
 
+    def inv_normalize_courier_output_setting(value: str, default_value: str) -> str:
+        """왼쪽 옵션값을 네이버 송장일괄발송 결과물에 들어갈 택배사명으로 보정합니다.
+
+        운송장/출고 엑셀에는 배송사가 '넥스트마일', '롯데'로 내려오지만,
+        네이버 송장일괄발송 엑셀에는 보통 '컬리넥스트마일', '롯데택배'처럼
+        등록 가능한 택배사명으로 넣어야 합니다.
+        사용자가 옵션에 '롯데'만 저장해 둔 경우에도 결과물에는 '롯데택배'가 나오게 합니다.
+        """
+        s = "" if value is None else str(value).strip()
+        if not s:
+            return default_value
+
+        normalized = inv_clean_header_text(s).lower()
+        if normalized in {"롯데", "lotte"}:
+            return "롯데택배"
+        if normalized in {"넥스트마일", "nextmile", "kurlynextmile"}:
+            return "컬리넥스트마일"
+        return s
+
     def inv_decrypt_office_excel(file_bytes: bytes, password: str) -> io.BytesIO:
         if msoffcrypto is None:
             raise ModuleNotFoundError("msoffcrypto not installed")
@@ -474,14 +493,26 @@ def render_invoice_register_page():
             inv_save_settings(
                 {
                     "tracking_password": tracking_password_input.strip(),
-                    "courier_nextmile": courier_nextmile_input.strip() or INV_COURIER_NEXTMILE_DEFAULT,
-                    "courier_lotte": courier_lotte_input.strip() or INV_COURIER_LOTTE_DEFAULT,
+                    "courier_nextmile": inv_normalize_courier_output_setting(
+                        courier_nextmile_input,
+                        INV_COURIER_NEXTMILE_DEFAULT,
+                    ),
+                    "courier_lotte": inv_normalize_courier_output_setting(
+                        courier_lotte_input,
+                        INV_COURIER_LOTTE_DEFAULT,
+                    ),
                 }
             )
             st.success("송장등록 설정 저장 완료")
 
-    courier_nextmile_input = courier_nextmile_input.strip() or INV_COURIER_NEXTMILE_DEFAULT
-    courier_lotte_input = courier_lotte_input.strip() or INV_COURIER_LOTTE_DEFAULT
+    courier_nextmile_input = inv_normalize_courier_output_setting(
+        courier_nextmile_input,
+        INV_COURIER_NEXTMILE_DEFAULT,
+    )
+    courier_lotte_input = inv_normalize_courier_output_setting(
+        courier_lotte_input,
+        INV_COURIER_LOTTE_DEFAULT,
+    )
 
     st.markdown('<div class="upload-title">1) 스마트스토어 엑셀(비번0000)</div>', unsafe_allow_html=True)
     f1 = st.file_uploader(
@@ -555,6 +586,15 @@ def render_invoice_register_page():
 
     miss = (out_df["송장번호"].isna() | (out_df["송장번호"].astype(str).str.strip() == "")).sum()
     st.write(f"총 {len(out_df)}건 / 송장번호 누락 {miss}건")
+
+    courier_counts = (
+        out_df.loc[out_df["송장번호"].astype(str).str.strip() != "", "택배사"]
+        .replace("", pd.NA)
+        .dropna()
+        .value_counts()
+    )
+    if not courier_counts.empty:
+        st.caption("택배사 반영: " + " / ".join(f"{name} {cnt}건" for name, cnt in courier_counts.items()))
 
     if not dup_info.empty:
         with st.expander("⚠️ 같은 주문자/수령자/주소인데 운송장번호가 여러 개인 경우", expanded=False):
